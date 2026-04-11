@@ -13,13 +13,13 @@ initializer → legalization → hard-macro optimization → soft-macro refineme
 Each stage must be independently replaceable and testable.
 
 --------------------------------------------------
-PHASE 0 — CORE INFRASTRUCTURE
+PHASE 0 — CORE INFRASTRUCTURE | CARSON
 --------------------------------------------------
 
 Objective:
 Create a shared system that all other modules plug into.
 
-Tasks:
+Tasks: 
 - Wrap evaluation utilities into a unified API:
   - evaluate(placement)
   - validate(placement)
@@ -39,7 +39,7 @@ Deliverables:
 - core/types.py
 
 --------------------------------------------------
-PHASE 1 — INITIALIZERS
+PHASE 1 — INITIALIZERS | They gave us the greedy and random, for now that is good enough, we can make more bespoke initializers later if need be
 --------------------------------------------------
 
 Objective:

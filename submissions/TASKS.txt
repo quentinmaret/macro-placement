@@ -218,17 +218,6 @@ Tasks:
 - Keep search + refinement as execution layer
 
 --------------------------------------------------
-TEAM STRUCTURE
---------------------------------------------------
-
-Team A — Infrastructure
-Team B — Legalization
-Team C — Optimization
-Team D — Representation
-Team E — Refinement
-Team F — ML
-
---------------------------------------------------
 EXECUTION PRIORITY
 --------------------------------------------------
 

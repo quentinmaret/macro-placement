@@ -14,21 +14,25 @@ macros unchanged, and leaves a clear refinement hook for future work.
 
 ---
 
-### ``simple.py``
+### ``rl_local_policy.py``
 
 #### Description
 
-Just an example for the moment but we'd put smth lke "testing the rl with ..."
+RL-style local policy template.
 
-#### Results
+This file keeps the same legality-first workflow as `core.py`, but changes the
+refinement stage into a sequential policy over local macro moves. It is meant
+to show what an RL-flavored model looks like in this repo before we build a
+full training stack.
 
-```
-Costs computed:
-    - Wirelength:  0.128768
-    - Density:     1.276113
-    - Congestion:  2.248285
-    - Proxy Cost:  1.890967
-```
+#### Notes
+
+- Starts from the initial placement and legalizes first.
+- Builds a hard-macro graph from benchmark nets.
+- Visits movable hard macros one by one.
+- Generates local legal actions for each macro.
+- Scores those actions with an interpretable policy over simple features.
+- Keeps the structure easy to replace with a learned policy later.
 
 ---
 
@@ -37,4 +41,4 @@ Costs computed:
 | Model | Main Idea | Status | ibm01 | All IBM | Runtime Notes | Keep Going? |
 |------|------|------|------|------|------|------|
 | `core.py` | Minimal-displacement legalization baseline | Ready | Pending | Pending | Designed for debugging and extension | Yes |
-| `simple.py` | Example placeholder | Placeholder | 1.890967 | Pending | Replace with real runtime notes later | Maybe |
+| `rl_local_policy.py` | Sequential RL-style local action policy over legal moves | Ready | Pending | Pending | Educational RL bridge before full training | Yes |

@@ -62,6 +62,22 @@ run_initializer_chain = _load_symbol(
     "run_initializer_chain",
 )
 
+# Load spacing helpers from the sibling module at import time.
+# Register in sys.modules before exec so @dataclass works on Python ≥ 3.12.
+import sys as _sys
+_spacing_spec = importlib.util.spec_from_file_location(
+    "_final_spacing",
+    str(_repo_root() / "submissions" / "final" / "spacing.py"),
+)
+_spacing_mod = importlib.util.module_from_spec(_spacing_spec)
+_sys.modules.setdefault("_final_spacing", _spacing_mod)
+_spacing_spec.loader.exec_module(_spacing_mod)
+SpacingConfig = _spacing_mod.SpacingConfig
+_spacing_violation_count = _spacing_mod.hard_macro_spacing_violation_count
+_spacing_min_clearance = _spacing_mod.min_hard_macro_clearance
+_spacing_penalty_fn = _spacing_mod.spacing_penalty
+_spacing_repair_fn = _spacing_mod.repair_spacing
+
 
 def _load_plc(name: str):
     from macro_place.loader import load_benchmark, load_benchmark_from_dir
@@ -143,6 +159,11 @@ class FinalMacroPlacer:
             or os.environ.get("MACRO_PLACER_LOG_PATH")
         )
         self._candidate_records: List[Dict[str, Any]] = []
+        self.spacing_config: SpacingConfig = SpacingConfig.from_env()
+        # MPC_FINAL_LOG=1 enables per-candidate JSONL logging to a default location
+        if self.spacing_config.log and not self.log_path:
+            log_dir = self.spacing_config.log_dir or "logs/final"
+            self.log_path = str(Path(log_dir) / "candidates.jsonl")
         self._candidate_metadata_by_name: Dict[str, Any] = {}
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
@@ -153,6 +174,7 @@ class FinalMacroPlacer:
         best_score = float("inf")
         best_placement: Optional[torch.Tensor] = None
         best_candidate_name: Optional[str] = None
+        collect_spacing_metrics = self._should_collect_spacing_metrics(benchmark)
 
         for name, candidate_type, factory in self._generate_candidates(benchmark):
             placement: Optional[torch.Tensor] = None
@@ -187,11 +209,16 @@ class FinalMacroPlacer:
             score: Optional[float] = None
             score_runtime = 0.0
             error: Optional[str] = None
+            sp_metrics: Dict[str, Any] = {}
 
             if valid:
+                if collect_spacing_metrics:
+                    sp_metrics = self._get_spacing_metrics(candidate, benchmark)
                 try:
                     score_start = time.perf_counter()
-                    score, score_metrics = self._score_with_metrics(candidate, benchmark, plc)
+                    score, score_metrics = self._score_with_metrics(
+                        candidate, benchmark, plc, self.spacing_config
+                    )
                     score_runtime = time.perf_counter() - score_start
                     overlap_count = int(score_metrics.get("overlap_count", overlap_count))
                 except Exception as exc:
@@ -217,6 +244,9 @@ class FinalMacroPlacer:
                 score=score,
                 became_best=became_best,
                 error=error,
+                spacing_violation_count=sp_metrics.get("spacing_violation_count"),
+                min_clearance_um=sp_metrics.get("min_clearance_um"),
+                spacing_penalty_val=sp_metrics.get("spacing_penalty"),
                 candidate_metadata=candidate_metadata,
             )
 
@@ -224,6 +254,12 @@ class FinalMacroPlacer:
             fallback_start = time.perf_counter()
             fallback = WillSeedPlacer(seed=42, refine_iters=self.will_refine_iters).place(benchmark)
             best_placement, repair_runtime = self._timed_repair_candidate(fallback, benchmark)
+            fb_valid = self._is_valid(best_placement, benchmark)
+            fb_sp = (
+                self._get_spacing_metrics(best_placement, benchmark)
+                if fb_valid and collect_spacing_metrics
+                else {}
+            )
             self._record_candidate(
                 benchmark=benchmark,
                 candidate="fallback_will_seed",
@@ -232,14 +268,30 @@ class FinalMacroPlacer:
                 repair_runtime_sec=repair_runtime,
                 score_runtime_sec=0.0,
                 total_runtime_sec=time.perf_counter() - fallback_start,
-                valid=self._is_valid(best_placement, benchmark),
+                valid=fb_valid,
                 overlap_count=self._hard_overlap_count(best_placement, benchmark),
                 score=None,
                 became_best=True,
+                spacing_violation_count=fb_sp.get("spacing_violation_count"),
+                min_clearance_um=fb_sp.get("min_clearance_um"),
+                spacing_penalty_val=fb_sp.get("spacing_penalty"),
             )
             best_candidate_name = "fallback_will_seed"
 
         self._mark_winner(best_score, best_candidate_name)
+
+        # Optional spacing repair on the winning placement only
+        if best_placement is not None and self.spacing_config.repair:
+            pre_repair = best_placement.clone()
+            best_placement, repair_info = _spacing_repair_fn(
+                best_placement, benchmark, self.spacing_config
+            )
+            if self._hard_overlap_count(best_placement, benchmark) != 0:
+                best_placement = pre_repair
+                repair_info["reverted"] = True
+                repair_info["revert_reason"] = "overlap"
+            self._annotate_winner_repair(repair_info)
+
         self._flush_candidate_log()
         if self.debug:
             self._print_summary(benchmark)
@@ -458,14 +510,61 @@ class FinalMacroPlacer:
         placement: torch.Tensor,
         benchmark: Benchmark,
         plc: Optional[Any],
+        spacing_config: Optional[Any] = None,
     ) -> Tuple[float, Dict[str, Any]]:
         if plc is not None:
             costs = compute_proxy_cost(placement, benchmark, plc)
             if costs["overlap_count"] == 0:
-                return float(costs["proxy_cost"]), costs
-            return self._surrogate_score(placement, benchmark), costs
+                score = float(costs["proxy_cost"])
+            else:
+                score = self._surrogate_score(placement, benchmark)
+            score += self._spacing_score_addon(placement, benchmark, spacing_config)
+            return score, costs
         overlap_count = self._hard_overlap_count(placement, benchmark)
-        return self._surrogate_score(placement, benchmark), {"overlap_count": overlap_count}
+        score = self._surrogate_score(placement, benchmark)
+        score += self._spacing_score_addon(placement, benchmark, spacing_config)
+        return score, {"overlap_count": overlap_count}
+
+    def _spacing_score_addon(
+        self,
+        placement: torch.Tensor,
+        benchmark: Benchmark,
+        spacing_config: Optional[Any],
+    ) -> float:
+        """Spacing penalty term added to the proxy score when weight > 0."""
+        if spacing_config is None or spacing_config.spacing_weight <= 0.0:
+            return 0.0
+        if not spacing_config.is_large_canvas(benchmark):
+            return 0.0
+        return spacing_config.spacing_weight * _spacing_penalty_fn(
+            placement, benchmark, spacing_config.clearance_um
+        )
+
+    def _should_collect_spacing_metrics(self, benchmark: Benchmark) -> bool:
+        if self.log_path:
+            return True
+        if self.spacing_config.repair:
+            return True
+        return (
+            self.spacing_config.spacing_weight > 0.0
+            and self.spacing_config.is_large_canvas(benchmark)
+        )
+
+    def _get_spacing_metrics(
+        self, placement: torch.Tensor, benchmark: Benchmark
+    ) -> Dict[str, Any]:
+        """Compute spacing metrics for logging (always computed for valid placements)."""
+        n = benchmark.num_hard_macros
+        if n <= 1:
+            return {"spacing_violation_count": 0, "min_clearance_um": None, "spacing_penalty": 0.0}
+        viol = _spacing_violation_count(placement, benchmark, self.spacing_config.clearance_um)
+        min_clr = _spacing_min_clearance(placement, benchmark)
+        sp = _spacing_penalty_fn(placement, benchmark, self.spacing_config.clearance_um)
+        return {
+            "spacing_violation_count": int(viol),
+            "min_clearance_um": None if min_clr == float("inf") else float(min_clr),
+            "spacing_penalty": float(sp),
+        }
 
     def _surrogate_score(self, placement: torch.Tensor, benchmark: Benchmark) -> float:
         hpwl = 0.0
@@ -520,10 +619,15 @@ class FinalMacroPlacer:
         became_best: bool,
         winner: bool = False,
         error: Optional[str] = None,
+        spacing_violation_count: Optional[int] = None,
+        min_clearance_um: Optional[float] = None,
+        spacing_penalty_val: Optional[float] = None,
         candidate_metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         record: Dict[str, Any] = {
             "benchmark": benchmark.name,
+            "canvas_width": float(benchmark.canvas_width),
+            "canvas_height": float(benchmark.canvas_height),
             "num_hard_macros": benchmark.num_hard_macros,
             "candidate": candidate,
             "candidate_type": candidate_type,
@@ -536,6 +640,9 @@ class FinalMacroPlacer:
             "score": float(score) if score is not None else None,
             "became_best": bool(became_best),
             "winner": bool(winner),
+            "spacing_violation_count": spacing_violation_count,
+            "min_clearance_um": min_clearance_um,
+            "spacing_penalty": spacing_penalty_val,
         }
         if error:
             record["error"] = error
@@ -554,6 +661,13 @@ class FinalMacroPlacer:
                     "density_overflow_energy"
                 )
         self._candidate_records.append(record)
+
+    def _annotate_winner_repair(self, repair_info: Dict[str, Any]) -> None:
+        """Attach spacing-repair results to the winner's log record."""
+        for record in reversed(self._candidate_records):
+            if record.get("winner"):
+                record["spacing_repair"] = repair_info
+                return
 
     def _mark_winner(self, best_score: float, best_candidate_name: Optional[str]) -> None:
         if best_candidate_name is not None:

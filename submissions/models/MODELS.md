@@ -96,7 +96,9 @@ peripheral,legalize
 
 Per-stage metadata includes runtime, proxy cost when a `PlacementCost` object is
 available, normalized wirelength/HPWL proxy, overlap metrics, boundary
-violations, legality, and legalization damage when it can be computed.
+violations, legality, legalization damage when it can be computed, and
+Stage-1 readiness metrics such as coarse bin density, density overflow energy,
+narrow-channel count, movable-macro spread, and crowding energy.
 
 Config is a nested dictionary keyed by operator name:
 
@@ -130,14 +132,20 @@ the runner returns the current placement and sets `budget_stopped=True`.
 | `hierarchical` | seed | Existing graph-clustering / recursive region initializer. | `placer.max_cluster_size`, `placer.min_cluster_size_to_split` | Connectivity-aware and usually structured. | Raw seed may still need `legalize`. |
 | `hierarchical_partition` | seed alias | Alias for `hierarchical`. | Same as `hierarchical` | Keeps old hierarchy naming discoverable. | Same as `hierarchical`. |
 | `graph_hierarchy` | seed alias | Alias for the original method name. | Same as `hierarchical` | Preserves existing behavior hooks. | Same as `hierarchical`. |
+| `anchor` | seed | Clone the benchmark anchor placement as a chain seed. | None currently | Lets Stage-1 transforms improve the already strong benchmark anchor path. | Can over-preserve the input if no transform follows. |
+| `benchmark_anchor` | seed alias | Alias for `anchor`. | Same as `anchor` | Exposes the direct ensemble fallback through the registry. | Same as `anchor`. |
 | `random_spread` | seed | Shuffled coarse-grid baseline with deterministic jitter. | `jitter_fraction` | Good reproducible baseline and stress test. | Not connectivity-aware. |
 | `grid` | seed | Uniform lattice placement, larger macros first. | None currently | Stable deterministic baseline. | Can ignore IO/connectivity. |
 | `pin_aware` | seed | Grid seed followed by IO/pin attraction. | `strength` | Useful when port locations are available. | Falls back to approximate net-neighbor targets when explicit ports are absent. |
-| `peripheral` | seed | Boundary-biased placement for large, high-degree, or IO-heavy macros. | `boundary_fraction`, `boundary_count`, `interior_margin` | Often sensible for IO-dominated designs. | Side assignment is heuristic. |
+| `peripheral` | seed | Boundary-biased placement for macros with refined periphery desirability. | `boundary_fraction`, `boundary_count`, `interior_margin`, `area_weight`, `io_weight`, `degree_weight`, `centrality_penalty`, `min_side_gap_fraction` | Backward-compatible hard seed with capacity-aware side assignment. | Still a hard seed; it can be too disruptive versus soft Stage-1 transforms. |
 | `pin_aware_shift` | transform | Nudge an existing placement toward connected IO sides. | `strength` | Cheap cleanup after hierarchy/grid seeds. | Can increase density near edges without `legalize`. |
 | `spectral_order` | transform | Reassign existing slots by a Fiedler-vector macro ordering. | `max_macros`, `raise_on_skip` | Fast ordering heuristic on smaller cases. | Skips large macro counts by default; it is not a full spectral/QAP placer. |
+| `periphery_bias` | transform | Softly move selected macros toward capacity-aware boundary targets. | `strength`, `boundary_fraction`, `boundary_count`, `area_weight`, `io_weight`, `degree_weight`, `centrality_penalty`, `min_side_gap_fraction`, `max_move_fraction` | Keeps existing placement topology and leaves legalization late. | Hurts when applied after already tangled seeds; best as a light anchor-stage bias. |
 | `force_smooth` | transform | Fixed-budget connectivity attraction plus overlap/boundary repulsion. | `iterations`, `attraction`, `repulsion`, `max_move` | Lightweight smoothing before legalization. | May still leave overlaps. |
-| `analytical_smooth` | transform alias | Alias for `force_smooth`. | Same as `force_smooth` | Easier name for analytical-style experiments. | Same as `force_smooth`. |
+| `analytical_smooth` | transform alias | Alias for `force_smooth`. | Same as `force_smooth` | Preserves earlier analytical-style experiments. | Same as `force_smooth`; use `analytical_stage1` for the physical Stage-1 loop. |
+| `analytical_stage1` | transform | Continuous physical relaxation with graph attraction, overlap/crowding repulsion, density overflow, boundary cleanup, and optional periphery attraction. | `iterations`, `attraction`, `overlap_repulsion`, `density_repulsion`, `boundary_repulsion`, `periphery_attraction`, `spread_repulsion`, `max_move`, `bin_count` | Improves refinement-agnostic physical quality without legalizing early. | Needs a good seed and budget; hierarchy starts were often worse than anchor starts. |
+| `analytical_physical` | transform alias | Alias for `analytical_stage1`. | Same as `analytical_stage1` | More descriptive name for Stage-1 experiments. | Same as `analytical_stage1`. |
+| `physical_smooth` | transform alias | Alias for `analytical_stage1`. | Same as `analytical_stage1` | Short alias for physical smoothing experiments. | Same as `analytical_stage1`. |
 | `macro_spread` | transform | Push overlapping/dense hard macros apart. | `iterations`, `strength`, `max_move` | Reduces obvious overlap and crowding. | Not a complete legalizer. |
 | `legalize` | repair | Existing conservative `CorePlacer` legalization. | `placer.search_radii`, `placer.step_scale`, `placer.safety_gap` | Reuses known legality repair path. | Can damage wirelength if the seed is very tangled. |
 | `local_swap` | refine | Small random greedy macro-position swaps. | `iterations`, `require_legal`, `use_proxy` | Cheap post-legalization refinement. | Uses graph surrogate by default; proxy scoring is slower and requires `plc`. |
@@ -205,6 +213,14 @@ legality and overlap metrics.
 
 #### Runtime-Aware Tournament Workflow
 
+Stage-1 is now treated as a soft physical initializer rather than an early
+legalizer. The strongest path starts from the benchmark `anchor`, applies
+`analytical_stage1` to reduce overlap energy, bin overflow, boundary pressure,
+and crowding, optionally adds a very light `periphery_bias`, and only then
+commits through `macro_spread` plus `legalize`. This keeps the placement
+refinement-agnostic: the transforms improve physical/topological quality but
+do not assume WillSeed-specific repair behavior.
+
 WillSeed is the current strong baseline. `submissions/will_seed/placer.py`
 legalizes the initial hard-macro placement, extracts macro connectivity when a
 `.plc` can be loaded, and runs a deterministic simulated-annealing-style
@@ -225,22 +241,36 @@ they are explicit operator strings such as `hierarchical,macro_spread,legalize`
 used as cheap, diverse tournament candidates and experiments. A chain is worth
 keeping only if its win rate or proxy improvement justifies its runtime.
 
-The current final placer chain portfolio is intentionally macro-count-aware:
+The current final placer chain portfolio is intentionally macro-count-aware.
+The winning Stage-1 idea is not "start every seed over"; it is to gently
+improve the strong benchmark anchor before late legalization. Hierarchy
+Stage-1 and pin-aware/periphery Stage-1 chains were tested on `ibm01`; they
+were legal but worse than the old hierarchy chains, so the final portfolio
+keeps only the anchor Stage-1 chains plus the strongest old comparisons.
 
 | Hard macros | Manual chains |
 |------:|------|
-| `n <= 220` | `hierarchical,macro_spread,legalize`; `hierarchical,legalize,local_swap`; `peripheral,legalize` |
-| `221 <= n <= 280` | `hierarchical,macro_spread,legalize`; `hierarchical,legalize` |
-| `281 <= n <= 320` | `hierarchical,legalize` |
+| `n <= 220` | `hierarchical,macro_spread,legalize`; `hierarchical,legalize,local_swap`; `anchor,analytical_stage1,legalize`; `anchor,periphery_bias,analytical_stage1,macro_spread,legalize` |
+| `221 <= n <= 280` | `anchor,analytical_stage1,legalize`; `anchor,periphery_bias,analytical_stage1,macro_spread,legalize`; `hierarchical,macro_spread,legalize`; `hierarchical,legalize` |
+| `281 <= n <= 320` | `anchor,analytical_stage1,legalize` |
 | `n > 320` | none |
 
 Operator budgets shrink with macro count:
 
-| Hard macros | macro_spread | force_smooth | local_swap | legalizer search radii |
-|------:|------:|------:|------:|------:|
-| `n <= 220` | 18 | 18 | 80 | 150 |
-| `221 <= n <= 280` | 10 | 8 | 30 | 100 |
-| `n > 280` | 4 | 4 | 0 | 60 |
+| Hard macros | macro_spread | analytical_stage1 | force_smooth | local_swap | legalizer search radii |
+|------:|------:|------:|------:|------:|------:|
+| `n <= 220` | 18 | 16 | 18 | 80 | 150 |
+| `221 <= n <= 280` | 12 | 16 | 8 | 30 | 100 |
+| `281 <= n <= 320` | 4 | 4 | 4 | 0 | 60 |
+| `n > 320` | none | none | none | none | fast WillSeed path |
+
+Final Stage-1 tournament config is intentionally conservative:
+
+- `periphery_bias`: `strength=0.10`, `boundary_fraction=0.08`,
+  `max_move_fraction=0.018`, high IO weight, and high centrality penalty.
+- `analytical_stage1`: `attraction=0.025`, `overlap_repulsion=0.80`,
+  `density_repulsion=0.05`, `boundary_repulsion=0.08`,
+  `spread_repulsion=0.10`, and `periphery_attraction=0.0`.
 
 The final tournament can write candidate-level JSONL without spamming stdout:
 
@@ -253,9 +283,10 @@ Each tournament JSONL row includes the benchmark, hard macro count, candidate
 name, candidate type (`will_seed`, `initializer_ensemble`, `chain`, or
 `fallback`), generation/repair/scoring/total runtime, validity, overlap count,
 score, whether it became the current best, whether it was the final winner,
-and any recorded error. Use these logs to spot slow candidates, chains that
-never win, candidates that need too much repair, and operator stages that
-consume budget without improving the tournament result.
+and any recorded error. Chain rows also include the initializer-chain metadata
+and final stage readiness metrics when available. Use these logs to spot slow
+candidates, chains that never win, candidates that need too much repair, and
+operator stages that consume budget without improving the tournament result.
 
 This is a manual/runtime-aware workflow, not automated chain optimization.
 Future work should build on the registry and metrics with automated chain
@@ -289,8 +320,8 @@ implemented yet.
 |------|------|------|------|------|------|------|
 | `core.py` | Minimal-displacement legalization baseline | Ready | Pending | Pending | Designed for debugging and extension | Yes |
 | `rl_local_policy.py` | Sequential RL-style local action policy over legal moves | Ready | Pending | Pending | Educational RL bridge before full training | Yes |
-| `initializer.py` | Registry-backed initializer suite plus hierarchy ensemble | Ready | Pending re-test | Pending | Manual chains now available through `scripts/test_initializers.py` | Yes |
-| `submissions/final/placer.py` | Deterministic proxy-scored tournament over Will Seed and initializer candidates | Final candidate | 1.2226 | 1.5071 | Zero overlaps; 657.40s total IBM runtime; worst case 131.19s on ibm18 | Tune runtime/quality tradeoffs |
+| `initializer.py` | Registry-backed initializer suite plus Stage-1 physical transforms | Ready | 1.1355 via final chain | 1.4938 via final tournament | Manual chains and readiness metrics available through `scripts/test_initializers.py` | Yes |
+| `submissions/final/placer.py` | Deterministic proxy-scored tournament with anchor Stage-1 candidates | Final candidate | 1.1355 | 1.4938 | Zero overlaps; 796.85s total IBM runtime; worst case 134.00s on ibm18 | Tune runtime/quality tradeoffs |
 
 ---
 
@@ -304,8 +335,8 @@ medium IBM benchmarks, it generates legal candidates from:
 - the exact `WillSeedPlacer(seed=42, refine_iters=3000)` baseline,
 - several additional deterministic Will Seed starts,
 - the initializer ensemble,
-- selected initializer chains using `macro_spread`, `force_smooth`, `legalize`,
-  and `local_swap`.
+- selected initializer chains using `anchor`, `periphery_bias`,
+  `analytical_stage1`, `macro_spread`, `legalize`, and `local_swap`.
 
 Each candidate is repaired for hard-macro overlap if needed, scored with the
 true proxy objective when the benchmark `.plc` can be loaded, and the lowest
@@ -315,10 +346,10 @@ this avoids multi-minute initializer legalization on large designs such as
 `ibm10`, `ibm12`, `ibm14`, and `ibm17`.
 
 This uses practical ideas from WireMask-BBO and VeoPlace without implementing
-their full stacks: optimize in a candidate/search space, keep legal placements
-as a hard constraint, use greedy legalization/repair, keep an elite-style
-portfolio of diverse starts, and let the real proxy objective choose among
-legal candidates.
+their full stacks: optimize in a candidate/search space, improve soft physical
+quality before commitment, keep legal placements as a hard constraint, use
+greedy legalization/repair, keep an elite-style portfolio of diverse starts,
+and let the real proxy objective choose among legal candidates.
 
 #### Verification
 
@@ -352,6 +383,15 @@ Observed:
 - Initializer chain quick check on `ibm01`: `hierarchical,legalize` at 1.4877
   and `hierarchical,macro_spread,legalize` at 1.4530. Direct initializer
   ensemble remains better on this benchmark.
+- Stage-1 initializer smoke on `ibm01` after tuning:
+  `hierarchical,analytical_stage1,macro_spread,legalize` reached 1.4518,
+  slightly better than `hierarchical,macro_spread,legalize` at 1.4530.
+  `hierarchical,periphery_bias,analytical_stage1,legalize` reached 1.5207,
+  and `pin_aware,periphery_bias,analytical_stage1,legalize` reached 1.6388;
+  these legal but losing starts were not kept in the final tournament.
+- Anchor Stage-1 tournament smoke on `ibm01`: winner
+  `chain:anchor,periphery_bias,analytical_stage1,macro_spread,legalize` at
+  1.1355 with 0 overlaps.
 
 Final verification:
 
@@ -361,12 +401,22 @@ uv run evaluate submissions/final/placer.py --all
 uv run python scripts/test_tournament.py --benchmark ibm01 --debug --output results/tournament_ibm01.jsonl
 ```
 
-Latest `ibm01` quick check after runtime-aware instrumentation: final placer
-1.2226, 0 overlaps, 37.07s; tournament diagnostics winner
-`initializer_ensemble` at 1.2226. Latest full IBM suite after the cleanup:
-average 1.5071, zero overlaps, 657.40s total.
+For repeated long all-IBM checks, the equivalent project-venv entrypoint was
+used to avoid repeated `uv` environment churn:
 
-Final all-IBM results:
+```bash
+MPLCONFIGDIR=/private/tmp/macro-placement-matplotlib \
+FINAL_PLACER_LOG_PATH=results/tournament_stage1_all_pruned.jsonl \
+.venv/bin/evaluate submissions/final/placer.py --all
+```
+
+Latest `ibm01` quick check after runtime-aware instrumentation: final placer
+1.1355, 0 overlaps, 90.94s in the final all-IBM run; tournament diagnostics
+winner `chain:anchor,periphery_bias,analytical_stage1,macro_spread,legalize`.
+Latest full IBM suite after Stage-1 pruning: average 1.4938, zero overlaps,
+796.85s total.
+
+Previous final all-IBM results:
 
 | Benchmark | Final Proxy | Will Seed Proxy | Overlaps | Runtime |
 |------|------:|------:|------:|------:|
@@ -389,17 +439,48 @@ Final all-IBM results:
 | ibm18 | 1.7921 | 1.7921 | 0 | 131.19s |
 | AVG | 1.5071 | 1.5336 | 0 | 657.40s total |
 
-Worst final proxy benchmarks are `ibm18`, `ibm17`, `ibm06`, `ibm12`, `ibm14`,
-and `ibm02`. Worst runtime is `ibm18`; it remains well under the one-hour
-per-benchmark requirement.
+Stage-1 all-IBM results:
+
+| Benchmark | Previous Final Proxy | New Final Proxy | Delta | Winner Candidate | Overlaps | Runtime |
+|------|------:|------:|------:|------|------:|------:|
+| ibm01 | 1.2226 | 1.1355 | -0.0871 | `chain:anchor,periphery_bias,analytical_stage1,macro_spread,legalize` | 0 | 90.94s |
+| ibm02 | 1.6409 | 1.5998 | -0.0411 | `chain:anchor,periphery_bias,analytical_stage1,macro_spread,legalize` | 0 | 102.20s |
+| ibm03 | 1.4003 | 1.3636 | -0.0367 | `chain:anchor,analytical_stage1,legalize` | 0 | 35.99s |
+| ibm04 | 1.3891 | 1.3858 | -0.0033 | `chain:anchor,analytical_stage1,legalize` | 0 | 44.20s |
+| ibm06 | 1.7198 | 1.6719 | -0.0479 | `chain:anchor,periphery_bias,analytical_stage1,macro_spread,legalize` | 0 | 44.95s |
+| ibm07 | 1.4949 | 1.4866 | -0.0083 | `chain:anchor,analytical_stage1,legalize` | 0 | 46.09s |
+| ibm08 | 1.5087 | 1.5061 | -0.0026 | `chain:anchor,analytical_stage1,legalize` | 0 | 69.94s |
+| ibm09 | 1.1361 | 1.1361 | -0.0000 | `initializer_ensemble` | 0 | 64.84s |
+| ibm10 | 1.4104 | 1.4104 | -0.0000 | `will_seed_baseline` | 0 | 23.54s |
+| ibm11 | 1.2547 | 1.2547 | -0.0000 | `will_seed_baseline` | 0 | 6.42s |
+| ibm12 | 1.6528 | 1.6528 | -0.0000 | `will_seed_baseline` | 0 | 19.19s |
+| ibm13 | 1.4113 | 1.4113 | -0.0000 | `will_seed_baseline` | 0 | 7.71s |
+| ibm14 | 1.6515 | 1.6515 | -0.0000 | `will_seed_baseline` | 0 | 23.11s |
+| ibm15 | 1.6379 | 1.6379 | -0.0000 | `will_seed_baseline` | 0 | 13.58s |
+| ibm16 | 1.5484 | 1.5484 | -0.0000 | `will_seed_baseline` | 0 | 25.90s |
+| ibm17 | 1.7493 | 1.7493 | -0.0000 | `will_seed_baseline` | 0 | 44.24s |
+| ibm18 | 1.7921 | 1.7919 | -0.0002 | `chain:anchor,analytical_stage1,legalize` | 0 | 134.00s |
+| AVG | 1.5071 | 1.4938 | -0.0134 | mixed | 0 | 796.85s total |
+
+Quick sample before the final all-IBM run (`ibm01`, `ibm02`, `ibm04`,
+`ibm06`, `ibm09`) moved from 1.4217 average to 1.3858 average. The only
+neutral sample case was `ibm09`, where `initializer_ensemble` stayed slightly
+ahead of the new Stage-1 candidates.
+
+Worst final proxy benchmarks remain `ibm18`, `ibm17`, `ibm06`, `ibm12`,
+`ibm14`, and `ibm02`. Worst runtime is still `ibm18`; it remains well under
+the one-hour per-benchmark requirement.
 
 #### Remaining Risks
 
 - The small/medium search cutoff is deliberately conservative and general, but
   it leaves larger benchmarks at the Will Seed baseline.
-- `ibm18` is under the runtime limit but much slower than the other small cases;
-  future work should add a time budget or cheaper pre-filter before initializer
-  chains.
+- Stage-1 improves the final average but increases total IBM runtime from
+  657.40s to 796.85s. The pruned portfolio removed non-winning hierarchy
+  Stage-1 chains; future work should add automatic marginal-value pruning.
+- `ibm18` is under the runtime limit but remains much slower than the other
+  small/medium cases; future work should add a cheaper pre-filter before
+  anchor analytical chains.
 - The final placer relies on loading `.plc` files to score candidates with the
   true proxy. If a future benchmark lacks a loadable `.plc`, it falls back to a
   graph/geometric surrogate.

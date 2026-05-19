@@ -124,17 +124,23 @@ class FinalMacroPlacer:
             (
                 "hierarchical,macro_spread,legalize",
                 "hierarchical,legalize,local_swap",
-                "peripheral,legalize",
+                "anchor,analytical_stage1,legalize",
+                "anchor,periphery_bias,analytical_stage1,macro_spread,legalize",
             ),
         ),
         (
             280,
             (
+                "anchor,analytical_stage1,legalize",
+                "anchor,periphery_bias,analytical_stage1,macro_spread,legalize",
                 "hierarchical,macro_spread,legalize",
                 "hierarchical,legalize",
             ),
         ),
-        (320, ("hierarchical,legalize",)),
+        (
+            320,
+            ("anchor,analytical_stage1,legalize",),
+        ),
     )
 
     def __init__(self, debug: Optional[bool] = None, log_path: Optional[str] = None) -> None:
@@ -158,11 +164,13 @@ class FinalMacroPlacer:
         if self.spacing_config.log and not self.log_path:
             log_dir = self.spacing_config.log_dir or "logs/final"
             self.log_path = str(Path(log_dir) / "candidates.jsonl")
+        self._candidate_metadata_by_name: Dict[str, Any] = {}
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
         self._set_seed(self.seed)
         plc = _load_plc(benchmark.name)
         self._candidate_records = []
+        self._candidate_metadata_by_name = {}
         best_score = float("inf")
         best_placement: Optional[torch.Tensor] = None
         best_candidate_name: Optional[str] = None
@@ -177,6 +185,7 @@ class FinalMacroPlacer:
                 placement = factory()
                 generation_runtime = time.perf_counter() - generation_start
             except Exception as exc:
+                candidate_metadata = self._candidate_metadata_by_name.pop(name, None)
                 self._record_candidate(
                     benchmark=benchmark,
                     candidate=name,
@@ -190,6 +199,7 @@ class FinalMacroPlacer:
                     score=None,
                     became_best=False,
                     error=str(exc),
+                    candidate_metadata=candidate_metadata,
                 )
                 continue
 
@@ -220,6 +230,7 @@ class FinalMacroPlacer:
                 best_placement = candidate
                 best_candidate_name = name
 
+            candidate_metadata = self._candidate_metadata_by_name.pop(name, None)
             self._record_candidate(
                 benchmark=benchmark,
                 candidate=name,
@@ -236,6 +247,7 @@ class FinalMacroPlacer:
                 spacing_violation_count=sp_metrics.get("spacing_violation_count"),
                 min_clearance_um=sp_metrics.get("min_clearance_um"),
                 spacing_penalty_val=sp_metrics.get("spacing_penalty"),
+                candidate_metadata=candidate_metadata,
             )
 
         if best_placement is None:
@@ -328,14 +340,7 @@ class FinalMacroPlacer:
                 (
                     f"chain:{chain}",
                     "chain",
-                    lambda chain=chain: run_initializer_chain(
-                        benchmark,
-                        chain,
-                        seed=self.seed,
-                        config=self._chain_config(benchmark),
-                        collect_metrics=False,
-                        plc=None,
-                    )[0],
+                    lambda chain=chain: self._run_chain_candidate(benchmark, chain),
                 )
             )
         return specs
@@ -354,32 +359,83 @@ class FinalMacroPlacer:
             force_smooth_iterations = 18
             local_swap_iterations = 80
             search_radii = 150
-            chain_budget_sec = 10.0
-            stage_budget_sec = 6.0
+            chain_budget_sec = 20.0
+            stage_budget_sec = 8.0
         elif n <= 280:
-            macro_spread_iterations = 10
+            macro_spread_iterations = 12
             force_smooth_iterations = 8
             local_swap_iterations = 30
             search_radii = 100
-            chain_budget_sec = 6.0
-            stage_budget_sec = 4.0
+            chain_budget_sec = 20.0
+            stage_budget_sec = 8.0
         else:
             macro_spread_iterations = 4
             force_smooth_iterations = 4
+            analytical_iterations = 4
             local_swap_iterations = 0
             search_radii = 60
-            chain_budget_sec = 3.0
-            stage_budget_sec = 2.0
+            chain_budget_sec = 14.0
+            stage_budget_sec = 6.0
+            periphery_strength = 0.10
+            periphery_fraction = 0.08
+        if n <= 220:
+            analytical_iterations = 16
+            periphery_strength = 0.10
+            periphery_fraction = 0.08
+        elif n <= 280:
+            analytical_iterations = 16
+            periphery_strength = 0.10
+            periphery_fraction = 0.08
+
+        canvas_scale = max(float(benchmark.canvas_width), float(benchmark.canvas_height), 1.0)
         return {
             "chain_budget_sec": chain_budget_sec,
             "stage_budget_sec": stage_budget_sec,
             "macro_spread": {"iterations": macro_spread_iterations, "strength": 0.9},
             "force_smooth": {"iterations": force_smooth_iterations, "attraction": 0.10},
+            "periphery_bias": {
+                "strength": periphery_strength,
+                "boundary_fraction": periphery_fraction,
+                "area_weight": 0.24,
+                "io_weight": 0.44,
+                "degree_weight": 0.10,
+                "centrality_penalty": 0.50,
+                "min_side_gap_fraction": 0.035,
+                "max_move_fraction": 0.018,
+                "min_score": 0.25,
+            },
+            "analytical_stage1": {
+                "iterations": analytical_iterations,
+                "attraction": 0.025,
+                "overlap_repulsion": 0.80,
+                "density_repulsion": 0.05,
+                "boundary_repulsion": 0.08,
+                "periphery_attraction": 0.0,
+                "spread_repulsion": 0.10,
+                "max_move": (0.010 if n <= 280 else 0.008) * canvas_scale,
+                "bin_count": 7 if n <= 280 else 6,
+                "boundary_fraction": periphery_fraction,
+                "target_density": 0.74,
+                "max_pairwise_macros": 340,
+                "min_side_gap_fraction": 0.035,
+            },
             "local_swap": {"iterations": local_swap_iterations, "require_legal": True},
             "local_shift": {"iterations": 0},
             "spectral_order": {"max_macros": 320},
             "placer": {"search_radii": search_radii, "step_scale": 0.25, "safety_gap": 0.03},
         }
+
+    def _run_chain_candidate(self, benchmark: Benchmark, chain: str) -> torch.Tensor:
+        placement, metadata = run_initializer_chain(
+            benchmark,
+            chain,
+            seed=self.seed,
+            config=self._chain_config(benchmark),
+            collect_metrics=True,
+            plc=None,
+        )
+        self._candidate_metadata_by_name[f"chain:{chain}"] = metadata
+        return placement
 
     def _set_seed(self, seed: int) -> None:
         random.seed(seed)
@@ -566,6 +622,7 @@ class FinalMacroPlacer:
         spacing_violation_count: Optional[int] = None,
         min_clearance_um: Optional[float] = None,
         spacing_penalty_val: Optional[float] = None,
+        candidate_metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         record: Dict[str, Any] = {
             "benchmark": benchmark.name,
@@ -589,6 +646,20 @@ class FinalMacroPlacer:
         }
         if error:
             record["error"] = error
+        if candidate_metadata is not None:
+            record["chain_runtime_sec"] = candidate_metadata.get("runtime_sec")
+            record["chain_budget_stopped"] = candidate_metadata.get("budget_stopped")
+            record["chain_final_operator"] = candidate_metadata.get("final_operator")
+            stage_metrics = candidate_metadata.get("stage_metrics", [])
+            if stage_metrics:
+                record["stage_metrics"] = stage_metrics
+                final_stage = stage_metrics[-1]
+                record["chain_final_overlap_count"] = final_stage.get("overlap_count")
+                record["chain_final_total_overlap_area"] = final_stage.get("total_overlap_area")
+                record["chain_final_max_bin_density"] = final_stage.get("max_bin_density")
+                record["chain_final_density_overflow_energy"] = final_stage.get(
+                    "density_overflow_energy"
+                )
         self._candidate_records.append(record)
 
     def _annotate_winner_repair(self, repair_info: Dict[str, Any]) -> None:

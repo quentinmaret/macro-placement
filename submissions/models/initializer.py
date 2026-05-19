@@ -1106,7 +1106,16 @@ class EnsembleInitializerPlacer(CorePlacer):
         heuristic. It keeps the existing slot geometry and only changes which
         macro occupies which slot.
         """
+        cfg = config or {}
         reordered = placement.clone()
+        max_macros = int(cfg.get("max_macros", 320))
+        if benchmark.num_hard_macros > max_macros:
+            if bool(cfg.get("raise_on_skip", False)):
+                raise RuntimeError(
+                    f"spectral_order skipped: {benchmark.num_hard_macros} hard macros "
+                    f"exceeds max_macros={max_macros}"
+                )
+            return self.restore_fixed_macros(reordered, benchmark)
         movable_indices = self.get_movable_hard_macro_indices(benchmark)
         if len(movable_indices) <= 2:
             return self.restore_fixed_macros(reordered, benchmark)
@@ -1154,6 +1163,8 @@ class EnsembleInitializerPlacer(CorePlacer):
         cfg = config or {}
         smoothed = placement.clone()
         iterations = int(cfg.get("iterations", 20))
+        if iterations <= 0:
+            return self.restore_fixed_macros(smoothed, benchmark)
         attraction = float(cfg.get("attraction", 0.10))
         repulsion = float(cfg.get("repulsion", 0.45))
         canvas_scale = max(float(benchmark.canvas_width), float(benchmark.canvas_height), 1.0)
@@ -1164,7 +1175,10 @@ class EnsembleInitializerPlacer(CorePlacer):
         movable_set = set(self.get_movable_hard_macro_indices(benchmark))
         edges = self.graph_edges(hard_graph)
 
+        deadline = cfg.get("deadline_sec")
         for _ in range(iterations):
+            if deadline is not None and time.perf_counter() >= float(deadline):
+                break
             forces = torch.zeros_like(smoothed)
 
             for left_idx, right_idx, weight in edges:
@@ -1201,13 +1215,18 @@ class EnsembleInitializerPlacer(CorePlacer):
         cfg = config or {}
         spread = placement.clone()
         iterations = int(cfg.get("iterations", 30))
+        if iterations <= 0:
+            return self.restore_fixed_macros(spread, benchmark)
         strength = float(cfg.get("strength", 0.90))
         canvas_scale = max(float(benchmark.canvas_width), float(benchmark.canvas_height), 1.0)
         max_move = float(cfg.get("max_move", 0.030 * canvas_scale))
 
         hard_indices = self.get_hard_macro_indices(benchmark)
         movable_set = set(self.get_movable_hard_macro_indices(benchmark))
+        deadline = cfg.get("deadline_sec")
         for _ in range(iterations):
+            if deadline is not None and time.perf_counter() >= float(deadline):
+                break
             forces = torch.zeros_like(spread)
             self.add_overlap_repulsion(
                 placement=spread,
@@ -1257,16 +1276,23 @@ class EnsembleInitializerPlacer(CorePlacer):
         cfg = config or {}
         rng = rng or torch.Generator().manual_seed(self.seed)
         refined = placement.clone()
+        iterations = int(cfg.get("iterations", 80))
+        if iterations <= 0:
+            return self.restore_fixed_macros(refined, benchmark)
         movable_indices = self.get_movable_hard_macro_indices(benchmark)
         if len(movable_indices) < 2:
             return self.restore_fixed_macros(refined, benchmark)
 
         hard_graph = self.build_hard_macro_graph(benchmark)
-        iterations = int(cfg.get("iterations", 80))
+        default_cap = max(1, len(movable_indices) * int(cfg.get("iteration_cap_multiplier", 2)))
+        iterations = min(iterations, int(cfg.get("max_iterations", default_cap)))
         require_legal = bool(cfg.get("require_legal", True))
         best_score = self.operator_score(refined, benchmark, hard_graph, cfg)
 
+        deadline = cfg.get("deadline_sec")
         for _ in range(iterations):
+            if deadline is not None and time.perf_counter() >= float(deadline):
+                break
             left_pos = int(torch.randint(len(movable_indices), (1,), generator=rng).item())
             right_pos = int(torch.randint(len(movable_indices), (1,), generator=rng).item())
             if left_pos == right_pos:
@@ -1274,25 +1300,26 @@ class EnsembleInitializerPlacer(CorePlacer):
 
             left_idx = movable_indices[left_pos]
             right_idx = movable_indices[right_pos]
-            candidate = refined.clone()
-            candidate[left_idx] = refined[right_idx]
-            candidate[right_idx] = refined[left_idx]
-            candidate[left_idx] = self.clamp_macro_to_canvas(candidate[left_idx], benchmark, left_idx)
-            candidate[right_idx] = self.clamp_macro_to_canvas(
-                candidate[right_idx], benchmark, right_idx
-            )
+            old_left = refined[left_idx].clone()
+            old_right = refined[right_idx].clone()
+            refined[left_idx] = self.clamp_macro_to_canvas(old_right, benchmark, left_idx)
+            refined[right_idx] = self.clamp_macro_to_canvas(old_left, benchmark, right_idx)
 
             if require_legal and not self.changed_macros_are_legal(
-                candidate,
+                refined,
                 benchmark,
                 [left_idx, right_idx],
             ):
+                refined[left_idx] = old_left
+                refined[right_idx] = old_right
                 continue
 
-            score = self.operator_score(candidate, benchmark, hard_graph, cfg)
+            score = self.operator_score(refined, benchmark, hard_graph, cfg)
             if score < best_score:
-                refined = candidate
                 best_score = score
+            else:
+                refined[left_idx] = old_left
+                refined[right_idx] = old_right
 
         return self.restore_fixed_macros(refined, benchmark)
 
@@ -1308,12 +1335,14 @@ class EnsembleInitializerPlacer(CorePlacer):
         """
         cfg = config or {}
         refined = placement.clone()
+        iterations = int(cfg.get("iterations", 2))
+        if iterations <= 0:
+            return self.restore_fixed_macros(refined, benchmark)
         movable_indices = self.get_movable_hard_macro_indices(benchmark)
         if not movable_indices:
             return self.restore_fixed_macros(refined, benchmark)
 
         hard_graph = self.build_hard_macro_graph(benchmark)
-        iterations = int(cfg.get("iterations", 2))
         shift_fraction = float(cfg.get("shift_fraction", 0.50))
         require_legal = bool(cfg.get("require_legal", True))
         best_score = self.operator_score(refined, benchmark, hard_graph, cfg)
@@ -1322,8 +1351,13 @@ class EnsembleInitializerPlacer(CorePlacer):
             movable_indices,
             key=lambda idx: -sum(hard_graph[idx].values()),
         )
+        deadline = cfg.get("deadline_sec")
         for _ in range(iterations):
+            if deadline is not None and time.perf_counter() >= float(deadline):
+                break
             for idx in ordered_indices:
+                if deadline is not None and time.perf_counter() >= float(deadline):
+                    break
                 width, height = benchmark.macro_sizes[idx].tolist()
                 step = max(width, height) * shift_fraction
                 directions = [
@@ -1805,22 +1839,49 @@ def run_initializer_chain(
     metadata: Dict[str, Any] = {
         "chain": names,
         "seed": seed,
+        "benchmark": problem.name,
+        "num_hard_macros": problem.num_hard_macros,
         "runtime_sec": None,
         "stage_metrics": [],
+        "budget_stopped": False,
+        "stopped_after_operator": None,
+        "final_operator": None,
     }
 
     start_time = time.perf_counter()
     previous_metrics: Optional[Dict[str, Any]] = None
+    chain_budget_sec = cfg.get("chain_budget_sec")
+    stage_budget_sec = cfg.get("stage_budget_sec")
+    chain_deadline = (
+        start_time + float(chain_budget_sec) if chain_budget_sec is not None else None
+    )
 
     for requested_name, operator in zip(names, operators):
+        if chain_deadline is not None and time.perf_counter() >= chain_deadline:
+            if current is None:
+                raise RuntimeError("Initializer chain budget expired before any placement was produced")
+            metadata["budget_stopped"] = True
+            metadata["stopped_after_operator"] = metadata.get("final_operator")
+            break
+
         operator_config: Dict[str, Any] = {}
         operator_config.update(cfg.get("*", {}))
         operator_config.update(cfg.get(operator.name, {}))
         operator_config.update(cfg.get(requested_name, {}))
         if plc is not None:
             operator_config.setdefault("plc", plc)
+        if stage_budget_sec is not None:
+            operator_config.setdefault("stage_budget_sec", float(stage_budget_sec))
 
         stage_start = time.perf_counter()
+        if stage_budget_sec is not None or chain_deadline is not None:
+            deadlines = []
+            if stage_budget_sec is not None:
+                deadlines.append(stage_start + float(stage_budget_sec))
+            if chain_deadline is not None:
+                deadlines.append(chain_deadline)
+            operator_config["deadline_sec"] = min(deadlines)
+
         current = operator.run(
             problem=problem,
             placement=current,
@@ -1830,15 +1891,32 @@ def run_initializer_chain(
         )
         current = helper.restore_fixed_macros(current, problem)
         stage_runtime = time.perf_counter() - stage_start
+        metadata["final_operator"] = requested_name
 
         if collect_metrics:
-            metrics = collect_initializer_metrics(current, problem, plc=plc)
+            try:
+                metrics = collect_initializer_metrics(current, problem, plc=plc)
+            except Exception as exc:
+                metrics = {
+                    "metrics_error": f"metric collection failed: {exc}",
+                    "valid": None,
+                    "legal": None,
+                    "overlap_count": None,
+                    "boundary_violations": None,
+                }
             metrics.update(
                 {
                     "operator": requested_name,
                     "canonical_operator": operator.name,
                     "kind": operator.kind,
                     "runtime_sec": stage_runtime,
+                    "macro_count": problem.num_hard_macros,
+                    "stage_budget_sec": float(stage_budget_sec)
+                    if stage_budget_sec is not None
+                    else None,
+                    "budget_exceeded": bool(
+                        stage_budget_sec is not None and stage_runtime > float(stage_budget_sec)
+                    ),
                 }
             )
             if (
@@ -1856,7 +1934,20 @@ def run_initializer_chain(
             metadata["stage_metrics"].append(metrics)
             previous_metrics = metrics
 
+        elapsed = time.perf_counter() - start_time
+        if (
+            (chain_budget_sec is not None and elapsed > float(chain_budget_sec))
+            or (stage_budget_sec is not None and stage_runtime > float(stage_budget_sec))
+        ):
+            if current is None:
+                raise RuntimeError("Initializer chain budget expired before any placement was produced")
+            metadata["budget_stopped"] = True
+            metadata["stopped_after_operator"] = requested_name
+            break
+
     metadata["runtime_sec"] = time.perf_counter() - start_time
+    if current is None:
+        raise RuntimeError("Initializer chain produced no placement")
     return current, metadata
 
 
@@ -1867,6 +1958,7 @@ def collect_initializer_metrics(
 ) -> Dict[str, Any]:
     """Collect available comparable metrics without making metrics mandatory."""
     metrics: Dict[str, Any] = {
+        "macro_count": benchmark.num_hard_macros,
         "proxy_cost": None,
         "hpwl": None,
         "wirelength_cost": None,
@@ -1875,7 +1967,7 @@ def collect_initializer_metrics(
         "overlap": None,
         "overlap_count": None,
         "total_overlap_area": None,
-        "boundary_violations": count_boundary_violations(placement, benchmark),
+        "boundary_violations": None,
         "valid": None,
         "legal": None,
         "metrics_error": None,
@@ -1889,9 +1981,14 @@ def collect_initializer_metrics(
                 benchmark.macro_positions[benchmark.macro_fixed],
                 atol=1e-3,
             )
-        )
+    )
     shape_ok = placement.shape == (benchmark.num_macros, 2)
     finite_ok = not bool(torch.isnan(placement).any() or torch.isinf(placement).any())
+
+    try:
+        metrics["boundary_violations"] = count_boundary_violations(placement, benchmark)
+    except Exception as exc:
+        metrics["metrics_error"] = f"boundary metrics failed: {exc}"
 
     try:
         from macro_place.objective import compute_overlap_metrics

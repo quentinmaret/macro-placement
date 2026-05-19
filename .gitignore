@@ -1,3 +1,15 @@
 .idea/
 **/__pycache__/
 macro_place.egg-info/
+# Local agent/tool files
+.claude/
+CLAUDE.md
+agents.md
+claude_spacing_patch.diff
+
+# Local/generated experiment outputs
+output/
+*.txt
+
+# macOS
+.DS_Store

@@ -1027,6 +1027,345 @@ class EnsembleInitializerPlacer(CorePlacer):
 
         return self.restore_fixed_macros(shifted, benchmark)
 
+    def compute_port_affinity_weights(self, benchmark: Benchmark) -> Dict[int, float]:
+        """Return normalized hard-macro affinity to explicit boundary ports."""
+        port_count = int(benchmark.port_positions.shape[0])
+        if port_count <= 0:
+            return {}
+
+        raw_weights: Dict[int, float] = {}
+        for net_pos, net_nodes in enumerate(benchmark.net_nodes):
+            nodes = [int(node) for node in net_nodes.tolist()]
+            hard_nodes = sorted(
+                {node for node in nodes if 0 <= node < benchmark.num_hard_macros}
+            )
+            if not hard_nodes:
+                continue
+
+            port_offsets = [
+                node - benchmark.num_macros
+                for node in nodes
+                if benchmark.num_macros <= node < benchmark.num_macros + port_count
+            ]
+            if not port_offsets:
+                continue
+
+            net_weight = (
+                float(benchmark.net_weights[net_pos])
+                if net_pos < int(benchmark.net_weights.shape[0])
+                else 1.0
+            )
+            contribution = net_weight * float(len(port_offsets)) / max(float(len(hard_nodes)), 1.0)
+            for macro_index in hard_nodes:
+                raw_weights[macro_index] = raw_weights.get(macro_index, 0.0) + contribution
+
+        max_weight = max(raw_weights.values()) if raw_weights else 0.0
+        if max_weight <= 1e-12:
+            return {}
+        return {idx: value / max_weight for idx, value in raw_weights.items()}
+
+    def compute_periphery_scores(
+        self,
+        benchmark: Benchmark,
+        config: Optional[Dict[str, Any]] = None,
+        placement: Optional[torch.Tensor] = None,
+        hard_graph: Optional[Dict[int, Dict[int, float]]] = None,
+        targets: Optional[Dict[int, torch.Tensor]] = None,
+        pin_weights: Optional[Dict[int, float]] = None,
+    ) -> Dict[int, float]:
+        """
+        Score movable hard macros for soft periphery bias.
+
+        The score favors large macros with genuine boundary/IO affinity and
+        penalizes internally connected macros whose pin target is central. This
+        keeps high graph degree from automatically meaning "move to the edge."
+        """
+        cfg = config or {}
+        movable_indices = self.get_movable_hard_macro_indices(benchmark)
+        if not movable_indices:
+            return {}
+
+        hard_graph = hard_graph or self.build_hard_macro_graph(benchmark)
+        if targets is None or pin_weights is None:
+            targets, pin_weights = self.compute_pin_attraction_targets(benchmark)
+        placement = placement if placement is not None else benchmark.macro_positions
+        port_weights = self.compute_port_affinity_weights(benchmark)
+
+        area_weight = float(cfg.get("area_weight", 0.30))
+        io_weight = float(cfg.get("io_weight", 0.34))
+        degree_weight = float(cfg.get("degree_weight", 0.18))
+        boundary_target_weight = float(cfg.get("boundary_target_weight", 0.24))
+        size_weight = float(cfg.get("size_weight", 0.10))
+        centrality_penalty = float(cfg.get("centrality_penalty", 0.38))
+        center_penalty = float(cfg.get("center_penalty", 0.16))
+
+        max_area = max(self.macro_area(benchmark, idx) for idx in movable_indices)
+        degrees = {idx: sum(hard_graph.get(idx, {}).values()) for idx in movable_indices}
+        max_degree = max(max(degrees.values()), 1.0)
+
+        canvas_width = float(benchmark.canvas_width)
+        canvas_height = float(benchmark.canvas_height)
+        edge_span = max(0.5 * min(canvas_width, canvas_height), 1e-6)
+        center = torch.tensor(
+            [0.5 * canvas_width, 0.5 * canvas_height],
+            dtype=placement.dtype,
+            device=placement.device,
+        )
+        max_center_distance = max(
+            math.sqrt((0.5 * canvas_width) ** 2 + (0.5 * canvas_height) ** 2),
+            1e-6,
+        )
+
+        raw_scores: Dict[int, float] = {}
+        for idx in movable_indices:
+            area_norm = self.macro_area(benchmark, idx) / max(max_area, 1e-6)
+            degree_norm = degrees.get(idx, 0.0) / max_degree
+            port_norm = port_weights.get(idx, 0.0)
+            fallback_pin_norm = pin_weights.get(idx, 0.0) if pin_weights else 0.0
+            io_norm = max(port_norm, 0.35 * fallback_pin_norm)
+
+            reference = targets.get(idx) if targets else None
+            if reference is None:
+                reference = placement[idx]
+            reference = reference.to(dtype=placement.dtype, device=placement.device)
+            x_pos = min(max(float(reference[0]), 0.0), canvas_width)
+            y_pos = min(max(float(reference[1]), 0.0), canvas_height)
+
+            edge_distance = min(x_pos, canvas_width - x_pos, y_pos, canvas_height - y_pos)
+            target_edge_affinity = max(0.0, min(1.0, 1.0 - edge_distance / edge_span))
+            center_distance = float(torch.norm(reference - center).item())
+            center_affinity = max(0.0, min(1.0, 1.0 - center_distance / max_center_distance))
+
+            width = float(benchmark.macro_sizes[idx, 0])
+            height = float(benchmark.macro_sizes[idx, 1])
+            side_pressure = max(width / max(canvas_width, 1e-6), height / max(canvas_height, 1e-6))
+            size_pressure = 0.65 * area_norm + 0.35 * min(side_pressure, 1.0)
+
+            boundary_degree = degree_norm * max(io_norm, 0.35 * target_edge_affinity)
+            internal_centrality = degree_norm * (1.0 - io_norm) * (0.45 + 0.55 * center_affinity)
+            raw_scores[idx] = (
+                area_weight * area_norm
+                + io_weight * io_norm
+                + boundary_target_weight * target_edge_affinity
+                + degree_weight * boundary_degree
+                + size_weight * size_pressure
+                - centrality_penalty * internal_centrality
+                - center_penalty * center_affinity * (1.0 - max(io_norm, target_edge_affinity))
+            )
+
+        positives = {idx: max(0.0, score) for idx, score in raw_scores.items()}
+        max_positive = max(positives.values()) if positives else 0.0
+        if max_positive <= 1e-12:
+            return {idx: 0.0 for idx in movable_indices}
+        return {idx: min(1.0, positives[idx] / max_positive) for idx in movable_indices}
+
+    def boundary_side_preferences(
+        self,
+        benchmark: Benchmark,
+        macro_indices: Sequence[int],
+        targets: Dict[int, torch.Tensor],
+        placement: Optional[torch.Tensor] = None,
+    ) -> Dict[int, List[str]]:
+        """Rank boundary sides for each macro by its pin target or current position."""
+        sides = ["left", "right", "bottom", "top"]
+        placement = placement if placement is not None else benchmark.macro_positions
+        preferences: Dict[int, List[str]] = {}
+        for macro_index in macro_indices:
+            reference = targets.get(macro_index)
+            if reference is None:
+                reference = placement[macro_index]
+            x_pos = float(reference[0])
+            y_pos = float(reference[1])
+            distances = {
+                "left": x_pos,
+                "right": float(benchmark.canvas_width) - x_pos,
+                "bottom": y_pos,
+                "top": float(benchmark.canvas_height) - y_pos,
+            }
+            preferred = self.choose_boundary_side(benchmark, macro_index, targets)
+            ordered = sorted(sides, key=lambda side: (distances[side], sides.index(side)))
+            if preferred in ordered:
+                ordered.remove(preferred)
+                ordered.insert(0, preferred)
+            preferences[macro_index] = ordered
+        return preferences
+
+    def estimate_side_capacities(
+        self,
+        benchmark: Benchmark,
+        macro_indices: Sequence[int],
+        min_side_gap_fraction: float = 0.035,
+    ) -> Dict[str, int]:
+        """Estimate rough side quotas so peripheral seeds do not overload one edge."""
+        sides = ["left", "right", "bottom", "top"]
+        count = len(macro_indices)
+        if count <= 0:
+            return {side: 0 for side in sides}
+
+        canvas_width = float(benchmark.canvas_width)
+        canvas_height = float(benchmark.canvas_height)
+        gap = max(0.0, min_side_gap_fraction) * min(canvas_width, canvas_height)
+        avg_width = sum(float(benchmark.macro_sizes[idx, 0]) for idx in macro_indices) / count
+        avg_height = sum(float(benchmark.macro_sizes[idx, 1]) for idx in macro_indices) / count
+        physical = {
+            "left": max(1, int(canvas_height / max(avg_height + gap, 1e-6))),
+            "right": max(1, int(canvas_height / max(avg_height + gap, 1e-6))),
+            "bottom": max(1, int(canvas_width / max(avg_width + gap, 1e-6))),
+            "top": max(1, int(canvas_width / max(avg_width + gap, 1e-6))),
+        }
+        side_lengths = {
+            "left": canvas_height,
+            "right": canvas_height,
+            "bottom": canvas_width,
+            "top": canvas_width,
+        }
+        total_length = max(sum(side_lengths.values()), 1e-6)
+        capacities = {
+            side: min(
+                physical[side],
+                max(1, int(round(count * side_lengths[side] / total_length))),
+            )
+            for side in sides
+        }
+
+        while sum(capacities.values()) < count:
+            expandable = [
+                side for side in sides if capacities[side] < max(physical[side], capacities[side])
+            ]
+            if not expandable:
+                expandable = sides
+            side = max(
+                expandable,
+                key=lambda item: (
+                    physical[item] - capacities[item],
+                    side_lengths[item],
+                    -sides.index(item),
+                ),
+            )
+            capacities[side] += 1
+
+        return capacities
+
+    def choose_capacity_aware_sides(
+        self,
+        benchmark: Benchmark,
+        macro_indices: Sequence[int],
+        preferences: Dict[int, List[str]],
+        config: Optional[Dict[str, Any]] = None,
+    ) -> Dict[int, str]:
+        """Assign macros to preferred sides while respecting rough side quotas."""
+        cfg = config or {}
+        sides = ["left", "right", "bottom", "top"]
+        capacities = self.estimate_side_capacities(
+            benchmark,
+            macro_indices,
+            min_side_gap_fraction=float(cfg.get("min_side_gap_fraction", 0.035)),
+        )
+        usage = {side: 0 for side in sides}
+        assignments: Dict[int, str] = {}
+        for macro_index in macro_indices:
+            assigned_side: Optional[str] = None
+            for side in preferences.get(macro_index, sides):
+                if usage[side] < capacities[side]:
+                    assigned_side = side
+                    break
+            if assigned_side is None:
+                assigned_side = min(
+                    sides,
+                    key=lambda side: (
+                        usage[side] / max(float(capacities[side]), 1.0),
+                        usage[side],
+                        sides.index(side),
+                    ),
+                )
+            assignments[macro_index] = assigned_side
+            usage[assigned_side] += 1
+        return assignments
+
+    def boundary_target_for_side(
+        self,
+        benchmark: Benchmark,
+        macro_index: int,
+        side: str,
+        placement: torch.Tensor,
+        targets: Dict[int, torch.Tensor],
+        config: Optional[Dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        """Build a clamped boundary target that preserves along-side affinity."""
+        cfg = config or {}
+        canvas_width = float(benchmark.canvas_width)
+        canvas_height = float(benchmark.canvas_height)
+        gap = float(cfg.get("min_side_gap_fraction", 0.035)) * min(canvas_width, canvas_height)
+        pullback = float(cfg.get("boundary_pullback_fraction", 0.0)) * min(
+            canvas_width,
+            canvas_height,
+        )
+        width = float(benchmark.macro_sizes[macro_index, 0])
+        height = float(benchmark.macro_sizes[macro_index, 1])
+        reference = targets.get(macro_index)
+        if reference is None:
+            reference = placement[macro_index]
+        reference = reference.to(dtype=placement.dtype, device=placement.device)
+
+        def clamp_along(value: float, low: float, high: float) -> float:
+            if low > high:
+                return 0.5 * (low + high)
+            return min(max(value, low), high)
+
+        if side == "left":
+            center = torch.tensor(
+                [
+                    width / 2.0 + pullback,
+                    clamp_along(
+                        float(reference[1]),
+                        height / 2.0 + gap,
+                        canvas_height - height / 2.0 - gap,
+                    ),
+                ],
+                dtype=placement.dtype,
+                device=placement.device,
+            )
+        elif side == "right":
+            center = torch.tensor(
+                [
+                    canvas_width - width / 2.0 - pullback,
+                    clamp_along(
+                        float(reference[1]),
+                        height / 2.0 + gap,
+                        canvas_height - height / 2.0 - gap,
+                    ),
+                ],
+                dtype=placement.dtype,
+                device=placement.device,
+            )
+        elif side == "bottom":
+            center = torch.tensor(
+                [
+                    clamp_along(
+                        float(reference[0]),
+                        width / 2.0 + gap,
+                        canvas_width - width / 2.0 - gap,
+                    ),
+                    height / 2.0 + pullback,
+                ],
+                dtype=placement.dtype,
+                device=placement.device,
+            )
+        else:
+            center = torch.tensor(
+                [
+                    clamp_along(
+                        float(reference[0]),
+                        width / 2.0 + gap,
+                        canvas_width - width / 2.0 - gap,
+                    ),
+                    canvas_height - height / 2.0 - pullback,
+                ],
+                dtype=placement.dtype,
+                device=placement.device,
+            )
+        return self.clamp_macro_to_canvas(center, benchmark, macro_index)
+
     def run_peripheral_seed(
         self,
         benchmark: Benchmark,
@@ -1043,11 +1382,15 @@ class EnsembleInitializerPlacer(CorePlacer):
             return placement
 
         hard_graph = self.build_hard_macro_graph(benchmark)
-        targets, io_weights = self.compute_pin_attraction_targets(benchmark)
-        max_area = max(self.macro_area(benchmark, idx) for idx in movable_indices)
-        max_degree = max(sum(hard_graph[idx].values()) for idx in movable_indices) or 1.0
-        max_io = max(io_weights.values()) if io_weights else 1.0
-        max_io = max(max_io, 1.0)
+        targets, pin_weights = self.compute_pin_attraction_targets(benchmark)
+        periphery_scores = self.compute_periphery_scores(
+            benchmark=benchmark,
+            config=cfg,
+            placement=placement,
+            hard_graph=hard_graph,
+            targets=targets,
+            pin_weights=pin_weights,
+        )
 
         boundary_fraction = float(cfg.get("boundary_fraction", 0.35))
         requested_count = int(math.ceil(len(movable_indices) * boundary_fraction))
@@ -1056,22 +1399,40 @@ class EnsembleInitializerPlacer(CorePlacer):
 
         scored = sorted(
             movable_indices,
-            key=lambda idx: -(
-                0.45 * self.macro_area(benchmark, idx) / max_area
-                + 0.35 * sum(hard_graph[idx].values()) / max_degree
-                + 0.20 * io_weights.get(idx, 0.0) / max_io
+            key=lambda idx: (
+                -periphery_scores.get(idx, 0.0),
+                -self.macro_area(benchmark, idx),
+                idx,
             ),
         )
         boundary_indices = scored[:boundary_count]
         interior_indices = scored[boundary_count:]
 
         side_groups: Dict[str, List[int]] = {"left": [], "right": [], "bottom": [], "top": []}
+        preferences = self.boundary_side_preferences(
+            benchmark,
+            boundary_indices,
+            targets,
+            placement=placement,
+        )
+        side_assignments = self.choose_capacity_aware_sides(
+            benchmark,
+            boundary_indices,
+            preferences,
+            config=cfg,
+        )
         for idx in boundary_indices:
-            side_groups[self.choose_boundary_side(benchmark, idx, targets)].append(idx)
+            side_groups[side_assignments[idx]].append(idx)
 
         for side, indices in side_groups.items():
             indices.sort(key=lambda idx: self.side_sort_key(benchmark, idx, side, targets))
-            self.place_indices_on_side(placement, benchmark, indices, side)
+            self.place_indices_on_side(
+                placement,
+                benchmark,
+                indices,
+                side,
+                min_side_gap_fraction=float(cfg.get("min_side_gap_fraction", 0.035)),
+            )
 
         if interior_indices:
             margin = float(cfg.get("interior_margin", self.estimate_peripheral_margin(benchmark)))
@@ -1091,6 +1452,102 @@ class EnsembleInitializerPlacer(CorePlacer):
             )
 
         return self.restore_fixed_macros(placement, benchmark)
+
+    def run_periphery_bias(
+        self,
+        placement: torch.Tensor,
+        benchmark: Benchmark,
+        rng: Optional[torch.Generator] = None,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        """
+        Softly move high periphery-score macros toward capacity-aware sides.
+
+        This is a transform, not a seed: it preserves the input topology and
+        leaves hard legality to later repair stages.
+        """
+        cfg = config or {}
+        biased = placement.clone()
+        movable_indices = self.get_movable_hard_macro_indices(benchmark)
+        if not movable_indices:
+            return self.restore_fixed_macros(biased, benchmark)
+
+        hard_graph = self.build_hard_macro_graph(benchmark)
+        targets, pin_weights = self.compute_pin_attraction_targets(benchmark)
+        periphery_scores = self.compute_periphery_scores(
+            benchmark=benchmark,
+            config=cfg,
+            placement=biased,
+            hard_graph=hard_graph,
+            targets=targets,
+            pin_weights=pin_weights,
+        )
+
+        boundary_fraction = float(cfg.get("boundary_fraction", 0.12))
+        requested_count = int(math.ceil(len(movable_indices) * boundary_fraction))
+        boundary_count = int(cfg.get("boundary_count", requested_count))
+        boundary_count = max(0, min(len(movable_indices), boundary_count))
+        if boundary_count <= 0:
+            return self.restore_fixed_macros(biased, benchmark)
+
+        min_score = float(cfg.get("min_score", 0.20))
+        selected = [
+            idx
+            for idx in sorted(
+                movable_indices,
+                key=lambda item: (
+                    -periphery_scores.get(item, 0.0),
+                    -self.macro_area(benchmark, item),
+                    item,
+                ),
+            )
+            if periphery_scores.get(idx, 0.0) >= min_score
+        ][:boundary_count]
+        if not selected:
+            return self.restore_fixed_macros(biased, benchmark)
+
+        preferences = self.boundary_side_preferences(
+            benchmark,
+            selected,
+            targets,
+            placement=biased,
+        )
+        side_assignments = self.choose_capacity_aware_sides(
+            benchmark,
+            selected,
+            preferences,
+            config=cfg,
+        )
+
+        canvas_scale = max(float(benchmark.canvas_width), float(benchmark.canvas_height), 1.0)
+        max_move = float(
+            cfg.get("max_move", float(cfg.get("max_move_fraction", 0.030)) * canvas_scale)
+        )
+        strength = max(0.0, min(1.0, float(cfg.get("strength", 0.18))))
+
+        for macro_index in selected:
+            side = side_assignments[macro_index]
+            target = self.boundary_target_for_side(
+                benchmark,
+                macro_index,
+                side,
+                biased,
+                targets,
+                config=cfg,
+            )
+            score = periphery_scores.get(macro_index, 0.0)
+            local_strength = strength * (0.25 + 0.75 * score)
+            move = (target - biased[macro_index]) * local_strength
+            norm = torch.norm(move).item()
+            if norm > max_move:
+                move = move * (max_move / max(norm, 1e-9))
+            biased[macro_index] = self.clamp_macro_to_canvas(
+                biased[macro_index] + move,
+                benchmark,
+                macro_index,
+            )
+
+        return self.restore_fixed_macros(biased, benchmark)
 
     def run_spectral_order(
         self,
@@ -1201,6 +1658,312 @@ class EnsembleInitializerPlacer(CorePlacer):
             self.apply_forces(smoothed, benchmark, hard_indices, movable_set, forces, max_move)
 
         return self.restore_fixed_macros(smoothed, benchmark)
+
+    def run_analytical_stage1(
+        self,
+        placement: torch.Tensor,
+        benchmark: Benchmark,
+        rng: Optional[torch.Generator] = None,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        """
+        Continuous physical Stage-1 relaxation before hard legalization.
+
+        The loop combines graph attraction, overlap/crowding repulsion, density
+        overflow pressure, boundary cleanup, and optional periphery attraction.
+        It intentionally does not legalize; later repair stages commit the soft
+        placement to a zero-overlap result.
+        """
+        cfg = config or {}
+        relaxed = placement.clone()
+        iterations = int(cfg.get("iterations", 24))
+        if iterations <= 0:
+            return self.restore_fixed_macros(relaxed, benchmark)
+
+        hard_indices = self.get_hard_macro_indices(benchmark)
+        movable_set = set(self.get_movable_hard_macro_indices(benchmark))
+        if not movable_set:
+            return self.restore_fixed_macros(relaxed, benchmark)
+
+        hard_graph = self.build_hard_macro_graph(benchmark)
+        edges = self.graph_edges(hard_graph)
+        max_edge_weight = max((weight for _left, _right, weight in edges), default=1.0)
+        max_edge_weight = max(max_edge_weight, 1.0)
+
+        canvas_scale = max(float(benchmark.canvas_width), float(benchmark.canvas_height), 1.0)
+        max_move = float(cfg.get("max_move", 0.020 * canvas_scale))
+        attraction = float(cfg.get("attraction", 0.035))
+        overlap_repulsion = float(cfg.get("overlap_repulsion", 0.95))
+        density_repulsion = float(cfg.get("density_repulsion", 0.060))
+        boundary_repulsion = float(cfg.get("boundary_repulsion", 0.10))
+        periphery_attraction = float(cfg.get("periphery_attraction", 0.0))
+        spread_repulsion = float(cfg.get("spread_repulsion", 0.12))
+        bin_count = int(cfg.get("bin_count", cfg.get("density_grid_size", 7)))
+        target_density = float(cfg.get("target_density", 0.72))
+        max_pairwise_macros = int(cfg.get("max_pairwise_macros", 360))
+
+        periphery_scores: Dict[int, float] = {}
+        side_assignments: Dict[int, str] = {}
+        targets: Dict[int, torch.Tensor] = {}
+        if periphery_attraction > 0.0:
+            targets, pin_weights = self.compute_pin_attraction_targets(benchmark)
+            periphery_scores = self.compute_periphery_scores(
+                benchmark=benchmark,
+                config=cfg,
+                placement=relaxed,
+                hard_graph=hard_graph,
+                targets=targets,
+                pin_weights=pin_weights,
+            )
+            boundary_fraction = float(cfg.get("boundary_fraction", 0.20))
+            periphery_count = int(
+                cfg.get("boundary_count", math.ceil(len(movable_set) * boundary_fraction))
+            )
+            periphery_count = max(0, min(len(movable_set), periphery_count))
+            periphery_indices = sorted(
+                movable_set,
+                key=lambda item: (
+                    -periphery_scores.get(item, 0.0),
+                    -self.macro_area(benchmark, item),
+                    item,
+                ),
+            )[:periphery_count]
+            preferences = self.boundary_side_preferences(
+                benchmark,
+                periphery_indices,
+                targets,
+                placement=relaxed,
+            )
+            side_assignments = self.choose_capacity_aware_sides(
+                benchmark,
+                periphery_indices,
+                preferences,
+                config=cfg,
+            )
+
+        deadline = cfg.get("deadline_sec")
+        for iteration in range(iterations):
+            if deadline is not None and time.perf_counter() >= float(deadline):
+                break
+            forces = torch.zeros_like(relaxed)
+            anneal = 0.55 + 0.45 * (1.0 - iteration / max(float(iterations), 1.0))
+
+            for left_idx, right_idx, weight in edges:
+                normalized_weight = min(float(weight) / max_edge_weight, 4.0)
+                delta = relaxed[right_idx] - relaxed[left_idx]
+                force = attraction * normalized_weight * delta / max(canvas_scale, 1e-6)
+                if left_idx in movable_set:
+                    forces[left_idx] = forces[left_idx] + force
+                if right_idx in movable_set:
+                    forces[right_idx] = forces[right_idx] - force
+
+            if overlap_repulsion > 0.0 and len(hard_indices) <= max_pairwise_macros:
+                self.add_overlap_repulsion(
+                    placement=relaxed,
+                    benchmark=benchmark,
+                    hard_indices=hard_indices,
+                    movable_set=movable_set,
+                    forces=forces,
+                    strength=overlap_repulsion,
+                )
+
+            if density_repulsion > 0.0:
+                self.add_density_repulsion(
+                    placement=relaxed,
+                    benchmark=benchmark,
+                    hard_indices=hard_indices,
+                    movable_set=movable_set,
+                    forces=forces,
+                    strength=density_repulsion,
+                    bin_count=bin_count,
+                    target_density=target_density,
+                )
+
+            if boundary_repulsion > 0.0:
+                self.add_boundary_repulsion(
+                    placement=relaxed,
+                    benchmark=benchmark,
+                    hard_indices=hard_indices,
+                    movable_set=movable_set,
+                    forces=forces,
+                    strength=boundary_repulsion,
+                    margin_fraction=float(cfg.get("boundary_margin_fraction", 0.014)),
+                )
+
+            if periphery_attraction > 0.0 and side_assignments:
+                for macro_index, side in side_assignments.items():
+                    if macro_index not in movable_set:
+                        continue
+                    score = periphery_scores.get(macro_index, 0.0)
+                    if score <= float(cfg.get("periphery_min_score", 0.08)):
+                        continue
+                    target = self.boundary_target_for_side(
+                        benchmark,
+                        macro_index,
+                        side,
+                        relaxed,
+                        targets,
+                        config=cfg,
+                    )
+                    forces[macro_index] = forces[macro_index] + (
+                        periphery_attraction * score * (target - relaxed[macro_index])
+                    )
+
+            if spread_repulsion > 0.0 and len(hard_indices) <= max_pairwise_macros:
+                self.add_spread_repulsion(
+                    placement=relaxed,
+                    benchmark=benchmark,
+                    hard_indices=hard_indices,
+                    movable_set=movable_set,
+                    forces=forces,
+                    strength=spread_repulsion,
+                    distance_factor=float(cfg.get("spread_distance_factor", 0.55)),
+                )
+
+            self.apply_forces(
+                relaxed,
+                benchmark,
+                hard_indices,
+                movable_set,
+                forces,
+                max_move=max_move * anneal,
+            )
+            relaxed = self.restore_fixed_macros(relaxed, benchmark)
+
+        return self.restore_fixed_macros(relaxed, benchmark)
+
+    def add_density_repulsion(
+        self,
+        placement: torch.Tensor,
+        benchmark: Benchmark,
+        hard_indices: Sequence[int],
+        movable_set: Iterable[int],
+        forces: torch.Tensor,
+        strength: float,
+        bin_count: int,
+        target_density: float,
+    ) -> None:
+        """Push macros out of overfull coarse density bins."""
+        bin_count = max(1, min(int(bin_count), 32))
+        movable_lookup = set(movable_set)
+        canvas_width = float(benchmark.canvas_width)
+        canvas_height = float(benchmark.canvas_height)
+        bin_width = canvas_width / bin_count
+        bin_height = canvas_height / bin_count
+        bin_area = max(bin_width * bin_height, 1e-6)
+
+        utilizations = np.zeros((bin_count, bin_count), dtype=np.float64)
+        members: Dict[Tuple[int, int], List[int]] = {}
+        for macro_index in hard_indices:
+            x_pos = min(max(float(placement[macro_index, 0]), 0.0), canvas_width - 1e-9)
+            y_pos = min(max(float(placement[macro_index, 1]), 0.0), canvas_height - 1e-9)
+            col = min(bin_count - 1, max(0, int(x_pos / max(bin_width, 1e-6))))
+            row = min(bin_count - 1, max(0, int(y_pos / max(bin_height, 1e-6))))
+            utilizations[row, col] += self.macro_area(benchmark, macro_index) / bin_area
+            members.setdefault((row, col), []).append(macro_index)
+
+        for (row, col), indices in members.items():
+            overflow = float(utilizations[row, col]) - target_density
+            if overflow <= 0.0:
+                continue
+            bin_center = torch.tensor(
+                [(col + 0.5) * bin_width, (row + 0.5) * bin_height],
+                dtype=placement.dtype,
+                device=placement.device,
+            )
+            for macro_index in indices:
+                if macro_index not in movable_lookup:
+                    continue
+                away = placement[macro_index] - bin_center
+                norm = torch.norm(away).item()
+                if norm <= 1e-9:
+                    angle = 2.399963229728653 * float(macro_index + row * bin_count + col)
+                    away = torch.tensor(
+                        [math.cos(angle), math.sin(angle)],
+                        dtype=placement.dtype,
+                        device=placement.device,
+                    )
+                    norm = 1.0
+                macro_scale = max(float(torch.max(benchmark.macro_sizes[macro_index]).item()), 1.0)
+                magnitude = strength * min(overflow, 3.0) * macro_scale
+                forces[macro_index] = forces[macro_index] + away * (magnitude / norm)
+
+    def add_boundary_repulsion(
+        self,
+        placement: torch.Tensor,
+        benchmark: Benchmark,
+        hard_indices: Sequence[int],
+        movable_set: Iterable[int],
+        forces: torch.Tensor,
+        strength: float,
+        margin_fraction: float,
+    ) -> None:
+        """Accumulate soft inward forces for macros near or outside the canvas."""
+        movable_lookup = set(movable_set)
+        canvas_width = float(benchmark.canvas_width)
+        canvas_height = float(benchmark.canvas_height)
+        margin = max(0.0, margin_fraction) * min(canvas_width, canvas_height)
+        for macro_index in hard_indices:
+            if macro_index not in movable_lookup:
+                continue
+            width = float(benchmark.macro_sizes[macro_index, 0])
+            height = float(benchmark.macro_sizes[macro_index, 1])
+            x_pos = float(placement[macro_index, 0])
+            y_pos = float(placement[macro_index, 1])
+            left_gap = x_pos - width / 2.0
+            right_gap = canvas_width - (x_pos + width / 2.0)
+            bottom_gap = y_pos - height / 2.0
+            top_gap = canvas_height - (y_pos + height / 2.0)
+            if left_gap < margin:
+                forces[macro_index, 0] += strength * (margin - left_gap)
+            if right_gap < margin:
+                forces[macro_index, 0] -= strength * (margin - right_gap)
+            if bottom_gap < margin:
+                forces[macro_index, 1] += strength * (margin - bottom_gap)
+            if top_gap < margin:
+                forces[macro_index, 1] -= strength * (margin - top_gap)
+
+    def add_spread_repulsion(
+        self,
+        placement: torch.Tensor,
+        benchmark: Benchmark,
+        hard_indices: Sequence[int],
+        movable_set: Iterable[int],
+        forces: torch.Tensor,
+        strength: float,
+        distance_factor: float,
+    ) -> None:
+        """Apply weak anti-collapse forces before boxes actually overlap."""
+        movable_lookup = set(movable_set)
+        for left_pos, left_idx in enumerate(hard_indices):
+            left_center = placement[left_idx]
+            left_w, left_h = benchmark.macro_sizes[left_idx].tolist()
+            for right_idx in hard_indices[left_pos + 1 :]:
+                if left_idx not in movable_lookup and right_idx not in movable_lookup:
+                    continue
+                right_center = placement[right_idx]
+                right_w, right_h = benchmark.macro_sizes[right_idx].tolist()
+                delta = right_center - left_center
+                distance = torch.norm(delta).item()
+                radius = distance_factor * max(left_w + right_w, left_h + right_h)
+                if distance >= radius:
+                    continue
+                if distance <= 1e-9:
+                    angle = 2.399963229728653 * float(left_idx + right_idx)
+                    direction = torch.tensor(
+                        [math.cos(angle), math.sin(angle)],
+                        dtype=placement.dtype,
+                        device=placement.device,
+                    )
+                    distance = 1.0
+                else:
+                    direction = delta / distance
+                magnitude = strength * (radius - distance)
+                force = direction * magnitude
+                if left_idx in movable_lookup:
+                    forces[left_idx] = forces[left_idx] - force
+                if right_idx in movable_lookup:
+                    forces[right_idx] = forces[right_idx] + force
 
     def run_macro_spread(
         self,
@@ -1566,18 +2329,36 @@ class EnsembleInitializerPlacer(CorePlacer):
         benchmark: Benchmark,
         macro_indices: Sequence[int],
         side: str,
+        min_side_gap_fraction: float = 0.0,
     ) -> None:
         """Place macros evenly along one canvas side."""
         if not macro_indices:
             return
 
         count = len(macro_indices)
+        gap = max(0.0, min_side_gap_fraction) * min(
+            float(benchmark.canvas_width),
+            float(benchmark.canvas_height),
+        )
+
+        def spaced_coordinate(pos: int, low: float, high: float) -> float:
+            if low > high:
+                return 0.5 * (low + high)
+            fraction = (pos + 1.0) / (count + 1.0)
+            return low + fraction * (high - low)
+
         for pos, macro_index in enumerate(macro_indices):
             width, height = benchmark.macro_sizes[macro_index].tolist()
-            fraction = (pos + 0.5) / count
             if side == "left":
                 center = torch.tensor(
-                    [width / 2.0, fraction * float(benchmark.canvas_height)],
+                    [
+                        width / 2.0,
+                        spaced_coordinate(
+                            pos,
+                            height / 2.0 + gap,
+                            float(benchmark.canvas_height) - height / 2.0 - gap,
+                        ),
+                    ],
                     dtype=placement.dtype,
                     device=placement.device,
                 )
@@ -1585,21 +2366,36 @@ class EnsembleInitializerPlacer(CorePlacer):
                 center = torch.tensor(
                     [
                         float(benchmark.canvas_width) - width / 2.0,
-                        fraction * float(benchmark.canvas_height),
+                        spaced_coordinate(
+                            pos,
+                            height / 2.0 + gap,
+                            float(benchmark.canvas_height) - height / 2.0 - gap,
+                        ),
                     ],
                     dtype=placement.dtype,
                     device=placement.device,
                 )
             elif side == "bottom":
                 center = torch.tensor(
-                    [fraction * float(benchmark.canvas_width), height / 2.0],
+                    [
+                        spaced_coordinate(
+                            pos,
+                            width / 2.0 + gap,
+                            float(benchmark.canvas_width) - width / 2.0 - gap,
+                        ),
+                        height / 2.0,
+                    ],
                     dtype=placement.dtype,
                     device=placement.device,
                 )
             else:
                 center = torch.tensor(
                     [
-                        fraction * float(benchmark.canvas_width),
+                        spaced_coordinate(
+                            pos,
+                            width / 2.0 + gap,
+                            float(benchmark.canvas_width) - width / 2.0 - gap,
+                        ),
                         float(benchmark.canvas_height) - height / 2.0,
                     ],
                     dtype=placement.dtype,
@@ -1968,6 +2764,12 @@ def collect_initializer_metrics(
         "overlap_count": None,
         "total_overlap_area": None,
         "boundary_violations": None,
+        "max_bin_density": None,
+        "max_macro_bin_utilization": None,
+        "density_overflow_energy": None,
+        "approximate_narrow_channel_count": None,
+        "movable_macro_spread": None,
+        "macro_crowding_energy": None,
         "valid": None,
         "legal": None,
         "metrics_error": None,
@@ -1999,6 +2801,15 @@ def collect_initializer_metrics(
     except Exception as exc:  # metrics should not make experiments unusable
         metrics["metrics_error"] = f"overlap metrics failed: {exc}"
 
+    try:
+        metrics.update(compute_stage1_readiness_metrics(placement, benchmark))
+    except Exception as exc:
+        existing_error = metrics.get("metrics_error")
+        readiness_error = f"stage1 readiness metrics failed: {exc}"
+        metrics["metrics_error"] = (
+            f"{existing_error}; {readiness_error}" if existing_error else readiness_error
+        )
+
     if plc is not None:
         try:
             from macro_place.objective import compute_proxy_cost
@@ -2024,6 +2835,90 @@ def collect_initializer_metrics(
     )
     metrics["valid"] = metrics["legal"]
     return normalize_metric_values(metrics)
+
+
+def compute_stage1_readiness_metrics(
+    placement: torch.Tensor,
+    benchmark: Benchmark,
+    bin_count: int = 8,
+    target_density: float = 0.72,
+    max_pairwise_macros: int = 520,
+) -> Dict[str, Any]:
+    """Compute lightweight physical-readiness metrics without requiring a PLC."""
+    hard_count = int(benchmark.num_hard_macros)
+    if hard_count <= 0:
+        return {
+            "max_bin_density": 0.0,
+            "max_macro_bin_utilization": 0.0,
+            "density_overflow_energy": 0.0,
+            "approximate_narrow_channel_count": 0,
+            "movable_macro_spread": 0.0,
+            "macro_crowding_energy": 0.0,
+        }
+
+    bin_count = max(1, min(int(bin_count), 32))
+    canvas_width = float(benchmark.canvas_width)
+    canvas_height = float(benchmark.canvas_height)
+    bin_width = canvas_width / bin_count
+    bin_height = canvas_height / bin_count
+    bin_area = max(bin_width * bin_height, 1e-6)
+    utilizations = np.zeros((bin_count, bin_count), dtype=np.float64)
+
+    hard_positions = placement[:hard_count].detach().cpu()
+    hard_sizes = benchmark.macro_sizes[:hard_count].detach().cpu()
+    for idx in range(hard_count):
+        x_pos = min(max(float(hard_positions[idx, 0]), 0.0), canvas_width - 1e-9)
+        y_pos = min(max(float(hard_positions[idx, 1]), 0.0), canvas_height - 1e-9)
+        col = min(bin_count - 1, max(0, int(x_pos / max(bin_width, 1e-6))))
+        row = min(bin_count - 1, max(0, int(y_pos / max(bin_height, 1e-6))))
+        area = float(hard_sizes[idx, 0] * hard_sizes[idx, 1])
+        utilizations[row, col] += area / bin_area
+
+    overflow = np.maximum(utilizations - target_density, 0.0)
+    movable_mask = (benchmark.get_movable_mask() & benchmark.get_hard_macro_mask())[:hard_count]
+    movable_positions = hard_positions[movable_mask.detach().cpu()]
+    canvas_scale = max(canvas_width, canvas_height, 1.0)
+    if int(movable_positions.shape[0]) > 1:
+        centroid = torch.mean(movable_positions, dim=0)
+        spread = torch.mean(torch.norm(movable_positions - centroid, dim=1)).item() / canvas_scale
+    else:
+        spread = 0.0
+
+    narrow_channel_count: Optional[int] = None
+    crowding_energy: Optional[float] = None
+    if hard_count <= max_pairwise_macros:
+        narrow_channel_count = 0
+        crowding_energy = 0.0
+        threshold = 0.030 * min(canvas_width, canvas_height)
+        for left_idx in range(hard_count):
+            left_x = float(hard_positions[left_idx, 0])
+            left_y = float(hard_positions[left_idx, 1])
+            left_w = float(hard_sizes[left_idx, 0])
+            left_h = float(hard_sizes[left_idx, 1])
+            for right_idx in range(left_idx + 1, hard_count):
+                right_x = float(hard_positions[right_idx, 0])
+                right_y = float(hard_positions[right_idx, 1])
+                right_w = float(hard_sizes[right_idx, 0])
+                right_h = float(hard_sizes[right_idx, 1])
+                gap_x = abs(right_x - left_x) - (left_w + right_w) / 2.0
+                gap_y = abs(right_y - left_y) - (left_h + right_h) / 2.0
+                if 0.0 <= gap_x < threshold and gap_y < 0.0:
+                    narrow_channel_count += 1
+                if 0.0 <= gap_y < threshold and gap_x < 0.0:
+                    narrow_channel_count += 1
+                positive_gap = max(0.0, min(max(gap_x, 0.0), max(gap_y, 0.0)))
+                if positive_gap < threshold:
+                    crowding_energy += ((threshold - positive_gap) / max(threshold, 1e-6)) ** 2
+
+    max_density = float(np.max(utilizations)) if utilizations.size else 0.0
+    return {
+        "max_bin_density": max_density,
+        "max_macro_bin_utilization": max_density,
+        "density_overflow_energy": float(np.sum(overflow * overflow)),
+        "approximate_narrow_channel_count": narrow_channel_count,
+        "movable_macro_spread": float(spread),
+        "macro_crowding_energy": crowding_energy,
+    }
 
 
 def normalize_metric_values(metrics: Dict[str, Any]) -> Dict[str, Any]:
@@ -2061,6 +2956,16 @@ def _seed_hierarchical(
     config: Dict[str, Any],
 ) -> torch.Tensor:
     return helper.run_hierarchical_seed(benchmark, rng=rng, config=config)
+
+
+def _seed_anchor(
+    helper: EnsembleInitializerPlacer,
+    benchmark: Benchmark,
+    placement: Optional[torch.Tensor],
+    rng: torch.Generator,
+    config: Dict[str, Any],
+) -> torch.Tensor:
+    return helper.run_benchmark_anchor_initializer(benchmark)
 
 
 def _seed_random_spread(
@@ -2131,6 +3036,18 @@ def _transform_spectral_order(
     return helper.run_spectral_order(placement, benchmark, rng=rng, config=config)
 
 
+def _transform_periphery_bias(
+    helper: EnsembleInitializerPlacer,
+    benchmark: Benchmark,
+    placement: Optional[torch.Tensor],
+    rng: torch.Generator,
+    config: Dict[str, Any],
+) -> torch.Tensor:
+    if placement is None:
+        raise ValueError("periphery_bias requires an existing placement")
+    return helper.run_periphery_bias(placement, benchmark, rng=rng, config=config)
+
+
 def _transform_force_smooth(
     helper: EnsembleInitializerPlacer,
     benchmark: Benchmark,
@@ -2141,6 +3058,18 @@ def _transform_force_smooth(
     if placement is None:
         raise ValueError("force_smooth requires an existing placement")
     return helper.run_force_smooth(placement, benchmark, rng=rng, config=config)
+
+
+def _transform_analytical_stage1(
+    helper: EnsembleInitializerPlacer,
+    benchmark: Benchmark,
+    placement: Optional[torch.Tensor],
+    rng: torch.Generator,
+    config: Dict[str, Any],
+) -> torch.Tensor:
+    if placement is None:
+        raise ValueError("analytical_stage1 requires an existing placement")
+    return helper.run_analytical_stage1(placement, benchmark, rng=rng, config=config)
 
 
 def _transform_macro_spread(
@@ -2200,6 +3129,9 @@ register_initializer_operator(
     )
 )
 register_initializer_operator(
+    InitializerOperator(name="anchor", kind="seed", runner=_seed_anchor, aliases=["benchmark_anchor"])
+)
+register_initializer_operator(
     InitializerOperator(name="random_spread", kind="seed", runner=_seed_random_spread)
 )
 register_initializer_operator(InitializerOperator(name="grid", kind="seed", runner=_seed_grid))
@@ -2225,10 +3157,25 @@ register_initializer_operator(
 )
 register_initializer_operator(
     InitializerOperator(
+        name="periphery_bias",
+        kind="transform",
+        runner=_transform_periphery_bias,
+    )
+)
+register_initializer_operator(
+    InitializerOperator(
         name="force_smooth",
         kind="transform",
         runner=_transform_force_smooth,
         aliases=["analytical_smooth"],
+    )
+)
+register_initializer_operator(
+    InitializerOperator(
+        name="analytical_stage1",
+        kind="transform",
+        runner=_transform_analytical_stage1,
+        aliases=["analytical_physical", "physical_smooth"],
     )
 )
 register_initializer_operator(

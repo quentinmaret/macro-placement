@@ -218,3 +218,113 @@ implemented yet.
 | `core.py` | Minimal-displacement legalization baseline | Ready | Pending | Pending | Designed for debugging and extension | Yes |
 | `rl_local_policy.py` | Sequential RL-style local action policy over legal moves | Ready | Pending | Pending | Educational RL bridge before full training | Yes |
 | `initializer.py` | Registry-backed initializer suite plus hierarchy ensemble | Ready | Pending re-test | Pending | Manual chains now available through `test_initializers.py` | Yes |
+| `submissions/final/placer.py` | Deterministic proxy-scored tournament over Will Seed and initializer candidates | Final candidate | 1.2226 | 1.5072 | Zero overlaps; 958.27s total IBM runtime; worst case 246.50s on ibm18 | Tune runtime/quality tradeoffs |
+
+---
+
+## Final Submission: `submissions/final/placer.py`
+
+#### Description
+
+The final submission is a deterministic tournament placer. For small and
+medium IBM benchmarks, it generates legal candidates from:
+
+- the exact `WillSeedPlacer(seed=42, refine_iters=3000)` baseline,
+- several additional deterministic Will Seed starts,
+- the initializer ensemble,
+- selected initializer chains using `macro_spread`, `force_smooth`, `legalize`,
+  and `local_swap`.
+
+Each candidate is repaired for hard-macro overlap if needed, scored with the
+true proxy objective when the benchmark `.plc` can be loaded, and the lowest
+zero-overlap placement is returned. For benchmarks with more than 320 hard
+macros, the placer takes a fast path and returns the proven Will Seed baseline;
+this avoids multi-minute initializer legalization on large designs such as
+`ibm10`, `ibm12`, `ibm14`, and `ibm17`.
+
+This uses practical ideas from WireMask-BBO and VeoPlace without implementing
+their full stacks: optimize in a candidate/search space, keep legal placements
+as a hard constraint, use greedy legalization/repair, keep an elite-style
+portfolio of diverse starts, and let the real proxy objective choose among
+legal candidates.
+
+#### Verification
+
+Setup and tests:
+
+```bash
+git submodule update --init external/MacroPlacement
+uv sync
+uv sync --extra dev
+uv run python -m pytest
+```
+
+`uv run pytest` resolved to an environment without `macro_place` importability
+in this workspace; `uv run python -m pytest` is the reliable invocation after
+installing the dev extra. Result: 5 passed.
+
+Baseline measurements:
+
+```bash
+uv run evaluate submissions/will_seed/placer.py -b ibm01
+uv run evaluate submissions/will_seed/placer.py --all
+uv run evaluate submissions/models/initializer.py -b ibm01
+uv run python test_initializers.py --benchmark ibm01
+```
+
+Observed:
+
+- Will Seed `ibm01`: 1.2920, 0 overlaps.
+- Will Seed all IBM average: 1.5336, 0 overlaps, 37.50s total.
+- Initializer direct `ibm01`: 1.2226, 0 overlaps, 24.14s.
+- Initializer chain test best on `ibm01`: `hierarchical,macro_spread,legalize`
+  at 1.4310; direct initializer ensemble was better on this benchmark.
+
+Final verification:
+
+```bash
+uv run evaluate submissions/final/placer.py -b ibm01
+uv run evaluate submissions/final/placer.py --all
+```
+
+Final all-IBM results:
+
+| Benchmark | Final Proxy | Will Seed Proxy | Overlaps | Runtime |
+|------|------:|------:|------:|------:|
+| ibm01 | 1.2226 | 1.2920 | 0 | 57.47s |
+| ibm02 | 1.6409 | 1.6798 | 0 | 106.99s |
+| ibm03 | 1.4003 | 1.4043 | 0 | 87.05s |
+| ibm04 | 1.3891 | 1.4478 | 0 | 75.29s |
+| ibm06 | 1.7198 | 1.7965 | 0 | 57.08s |
+| ibm07 | 1.4949 | 1.5903 | 0 | 90.97s |
+| ibm08 | 1.5087 | 1.5877 | 0 | 130.82s |
+| ibm09 | 1.1361 | 1.1625 | 0 | 73.43s |
+| ibm10 | 1.4116 | 1.4116 | 0 | 5.46s |
+| ibm11 | 1.2547 | 1.2547 | 0 | 1.70s |
+| ibm12 | 1.6528 | 1.6528 | 0 | 4.29s |
+| ibm13 | 1.4113 | 1.4113 | 0 | 2.02s |
+| ibm14 | 1.6515 | 1.6515 | 0 | 4.72s |
+| ibm15 | 1.6379 | 1.6379 | 0 | 2.59s |
+| ibm16 | 1.5484 | 1.5484 | 0 | 3.00s |
+| ibm17 | 1.7493 | 1.7493 | 0 | 8.90s |
+| ibm18 | 1.7921 | 1.7921 | 0 | 246.50s |
+| AVG | 1.5072 | 1.5336 | 0 | 958.27s total |
+
+Worst final proxy benchmarks are `ibm18`, `ibm17`, `ibm06`, `ibm12`, `ibm14`,
+and `ibm02`. Worst runtime is `ibm18`; it is still well under the one-hour
+per-benchmark requirement.
+
+#### Remaining Risks
+
+- The small/medium search cutoff is deliberately conservative and general, but
+  it leaves larger benchmarks at the Will Seed baseline.
+- `ibm18` is under the runtime limit but much slower than the other small cases;
+  future work should add a time budget or cheaper pre-filter before initializer
+  chains.
+- The final placer relies on loading `.plc` files to score candidates with the
+  true proxy. If a future benchmark lacks a loadable `.plc`, it falls back to a
+  graph/geometric surrogate.
+- `macro_place.loader` creates a temporary parser-compatible netlist copy when
+  IBM data contains signed scientific notation like `5.68434e-16`; this keeps
+  `external/MacroPlacement` clean while preserving the original evaluator and
+  scoring logic.

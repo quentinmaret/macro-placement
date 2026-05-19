@@ -4,12 +4,49 @@ Benchmark loader - extracts data from PlacementCost into PyTorch tensors.
 Leverages the existing MacroPlacement parser instead of reimplementing.
 """
 
+import hashlib
 import os
+import re
+from decimal import Decimal
+from pathlib import Path
 import torch
 from typing import Optional, Tuple
 
 from macro_place._plc import PlacementCost
 from macro_place.benchmark import Benchmark
+
+
+_SCIENTIFIC_FLOAT_RE = re.compile(
+    r"(?<![\w.])([+-]?(?:\d+(?:\.\d*)?|\.\d+)[eE][+-]?\d+)(?![\w.])"
+)
+
+
+def _format_decimal_without_exponent(match: re.Match) -> str:
+    """Return a decimal string for parsers that cannot read scientific notation."""
+    return format(Decimal(match.group(1)), "f")
+
+
+def _netlist_for_placement_cost(netlist_file: str) -> str:
+    """
+    Return a PlacementCost-readable netlist path.
+
+    The vendored MacroPlacement text-protobuf parser does not accept signed
+    scientific notation such as `5.68434e-16` in float fields. Rather than
+    modifying the submodule, create a deterministic temporary copy with those
+    tokens expanded to ordinary decimal notation when needed.
+    """
+    source = Path(netlist_file)
+    text = source.read_text()
+    sanitized = _SCIENTIFIC_FLOAT_RE.sub(_format_decimal_without_exponent, text)
+    if sanitized == text:
+        return netlist_file
+
+    digest = hashlib.sha1(str(source.resolve()).encode("utf-8")).hexdigest()[:16]
+    out_dir = Path("/private/tmp/macro-place-sanitized-netlists") / digest
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / source.name
+    out_path.write_text(sanitized)
+    return str(out_path)
 
 
 def load_benchmark(
@@ -27,8 +64,10 @@ def load_benchmark(
         Tuple of (Benchmark, PlacementCost) - Benchmark contains PyTorch tensors,
         PlacementCost object is needed for cost computation
     """
+    original_netlist_file = netlist_file
+
     # Initialize PlacementCost (parses netlist)
-    plc = PlacementCost(netlist_file)
+    plc = PlacementCost(_netlist_for_placement_cost(netlist_file))
 
     # Optionally restore placement from .plc file
     if plc_file:
@@ -38,7 +77,7 @@ def load_benchmark(
     # IBM paths: .../ibm01/netlist.pb.txt  -> "ibm01"
     # NG45 paths: .../ariane133/netlist/output_CT_Grouping/netlist.pb.txt -> "ariane133"
     if name is None:
-        name = os.path.basename(os.path.dirname(netlist_file))
+        name = os.path.basename(os.path.dirname(original_netlist_file))
         # NG45 designs have extra subdirectory levels; walk up to find the design name
         if name in ("output_CT_Grouping", "output_CodeElement"):
             name = os.path.basename(

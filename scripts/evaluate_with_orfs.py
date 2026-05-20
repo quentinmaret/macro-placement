@@ -18,6 +18,7 @@ Usage:
 import sys
 import json
 import argparse
+import os
 import shutil
 import subprocess
 import resource
@@ -40,7 +41,19 @@ sys.path.insert(0, str(Path(__file__).parent))
 from benchmark import Benchmark
 from loader import load_benchmark_from_dir
 from objective import compute_proxy_cost
-from orfs_integration.design_generator import create_orfs_design, ORFSDesign
+try:
+    from orfs_integration.design_generator import create_orfs_design, ORFSDesign
+except ModuleNotFoundError:
+    def create_orfs_design(*args, **kwargs):
+        raise RuntimeError(
+            "orfs_integration is unavailable; fallback ORFS config generation cannot run"
+        )
+
+    class ORFSDesign:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError(
+                "orfs_integration is unavailable; fallback ORFS config generation cannot run"
+            )
 from generate_macro_placement_tcl import write_orfs_macro_placement
 
 
@@ -92,12 +105,36 @@ def run_orfs_flow(design_dir: Path, orfs_root: Path, use_docker: bool = True, sk
 
     # Build command with docker_shell wrapper if requested
     if use_docker:
+        docker_image = os.environ.get("OR_IMAGE", "openroad/orfs:latest")
+        docker_platform = os.environ.get("ORFS_DOCKER_PLATFORM")
         cmd = [
-            "util/docker_shell",
-            "make",
-            f"DESIGN_CONFIG=./designs/{tech}/{design_name}/config.mk",
-            "finish"  # Run through detailed routing
+            "docker",
+            "run",
+            "--rm",
+            "-i",
         ]
+        if docker_platform:
+            cmd.extend(["--platform", docker_platform])
+        cmd.extend([
+            "-u",
+            f"{os.getuid()}:{os.getgid()}",
+            "-v",
+            f"{flow_dir.resolve()}:/OpenROAD-flow-scripts/flow",
+            "-e",
+            "FLOW_HOME=/OpenROAD-flow-scripts/flow/",
+            "-e",
+            "YOSYS_EXE=/OpenROAD-flow-scripts/tools/install/yosys/bin/yosys",
+            "-e",
+            "OPENROAD_EXE=/OpenROAD-flow-scripts/tools/install/OpenROAD/bin/openroad",
+            docker_image,
+            "bash",
+            "-lc",
+            (
+                "source /OpenROAD-flow-scripts/env.sh; "
+                "cd /OpenROAD-flow-scripts/flow; "
+                f"make DESIGN_CONFIG=./designs/{tech}/{design_name}/config.mk finish"
+            ),
+        ])
     else:
         cmd = [
             "make",
@@ -128,7 +165,7 @@ def run_orfs_flow(design_dir: Path, orfs_root: Path, use_docker: bool = True, sk
                 stdout=fout,
                 stderr=ferr,
                 timeout=21600,  # 6 hour timeout
-                preexec_fn=_set_memory_limit,
+                preexec_fn=None if use_docker else _set_memory_limit,
             )
         except subprocess.TimeoutExpired:
             print("ERROR: ORFS timed out after 6 hours")

@@ -314,6 +314,149 @@ implemented yet.
 
 ---
 
+### ``ml_param_tournament.py``
+
+#### Description
+
+Adaptive branch-family parameter tuner. It is a per-instance optimizer over
+existing initializer/operator chains, not offline ML training and not broad
+arbitrary chain search.
+
+The failed first version optimized hierarchy / analytical chains that were
+structurally weak on IBM01: the best hierarchy primary preset was around 1.4763
+while the current final tournament was around 1.1355. The useful lesson was not
+that IBM01 needs a one-off config; it was that parameter tuning only helps after
+the search starts in a competitive branch family.
+
+The active version therefore keeps a small registry of branch families and runs
+them in stages:
+
+1. always run `anchor,legalize` as a safe legal baseline,
+2. probe a few representative presets per enabled branch family,
+3. choose the current benchmark's best branch family or top few families,
+4. run a small directed parameter sweep around that basin,
+5. return the best legal post-legalize proxy candidate, falling back to the
+   baseline if the tuner is illegal or worse.
+
+The default registry includes:
+
+- `anchor_stage1_spread`:
+  `anchor,periphery_bias,analytical_stage1,macro_spread,legalize`.
+- `anchor_stage1`:
+  `anchor,analytical_stage1,legalize`.
+- a large-macro WillSeed fallback for benchmarks where the Stage-1 chain
+  portfolio is unsuitable.
+
+WillSeed seed sweeps and the initializer ensemble are still present, but only in
+`ML_PARAM_MODE=explore` or behind `ML_PARAM_ENABLE_BROAD_FAMILIES=1`; they do
+not dominate the default runtime.
+
+IBM01 discovered a strong `anchor_stage1_spread` low-gap / wide-legalizer basin
+called `LOW_GAP_WIDE_LEGALIZER`. That preset is kept as a reusable branch-family
+preset, not as an IBM01 benchmark gate. Directed variants then adjust legalizer
+gap/radius/step, Stage-1 overlap/density/attraction, macro-spread strength, and
+periphery softness around the current winning basin.
+
+Ranking is:
+
+1. legal placement,
+2. lower post-legalize `proxy_cost` when a `.plc` is available,
+3. overlap / boundary / fallback surrogate only when proxy is unavailable,
+4. runtime only as a tie-breaker or hard-budget guardrail.
+
+#### Modes And Controls
+
+```bash
+ML_PARAM_MODE=adaptive uv run evaluate submissions/models/ml_param_tournament.py -b ibm01
+ML_PARAM_FAST_MODE=1 uv run evaluate submissions/models/ml_param_tournament.py -b ibm01
+ML_PARAM_MODE=explore uv run evaluate submissions/models/ml_param_tournament.py -b ibm01
+```
+
+Important controls:
+
+- `ML_PARAM_TOTAL_BUDGET_SEC`, default 480.
+- `ML_PARAM_BRANCH_PROBE_BUDGET_SEC`, default 60.
+- `ML_PARAM_SWEEP_BUDGET_SEC`, default 180.
+- `ML_PARAM_MAX_BRANCH_FAMILIES`, default 1.
+- `ML_PARAM_MAX_VARIANTS`, default 10.
+- `ML_PARAM_ENABLE_BROAD_FAMILIES`, default off.
+- `ML_PARAM_ENABLE_LOCAL_REFINEMENT`, default off because IBM01 logs showed
+  local refinement hurt the best candidate.
+- `ML_PARAM_USE_PREFIX_REUSE`, parsed but not currently used; the active
+  directed variants usually change prefix stages, so a prefix cache would add
+  complexity before it saves much time.
+
+Diagnostics are written as JSONL under `runs/ml_param_tournament/` by default,
+or to `ML_PARAM_TOURNAMENT_LOG_PATH` when set. Each row includes benchmark,
+mode, stage, branch family, candidate name, chain, config, parent, variant
+family, runtime, final proxy, overlap count, boundary violations, legality,
+selected/accepted state, per-stage metrics, errors, and prefix-reuse status.
+
+#### How To Run
+
+```bash
+ML_PARAM_MODE=adaptive \
+ML_PARAM_TOURNAMENT_LOG_PATH=runs/ml_param_tournament/adaptive_ibm01.jsonl \
+uv run evaluate submissions/models/ml_param_tournament.py -b ibm01
+
+ML_PARAM_FAST_MODE=1 \
+ML_PARAM_TOURNAMENT_LOG_PATH=runs/ml_param_tournament/fast_ibm01.jsonl \
+uv run evaluate submissions/models/ml_param_tournament.py -b ibm01
+```
+
+For final-tournament branch attribution:
+
+```bash
+FINAL_PLACER_BRANCH_DEBUG=1 \
+FINAL_PLACER_LOG_PATH=runs/ml_param_tournament/final_branch_debug_ibm01.jsonl \
+uv run evaluate submissions/final/placer.py -b ibm01
+```
+
+To add a future branch family, add a `BranchFamily` entry in
+`build_branch_families()` with a chain/callable, probe presets, and an optional
+directed variant builder. Keep the default probe count small; use
+`ML_PARAM_MODE=explore` for wider experiments.
+
+Known limitations:
+
+- The tuner only searches parameters around registered branch families.
+- Directed variants are hand-written, not learned.
+- Some useful branches, especially WillSeed, expose only a few tunable knobs.
+- If proxy metrics are unavailable, fallback scoring uses legality, overlap,
+  boundary, density, and wirelength-like surrogate metrics.
+- Prefix reuse is intentionally deferred until legalizer-only sweeps justify
+  the added state management.
+
+Archived failed first attempt:
+
+- Old logs from the hierarchy-first experiment were moved to
+  `runs/archive/ml_param_tournament_hierarchy_failed/`.
+- That archive is useful only as a negative result; it is not the active
+  optimization direction.
+
+IBM01 reference before this simplification:
+
+- `anchor,legalize`: about 1.2226, zero overlaps, about 15s.
+- current final tournament: about 1.1355, zero overlaps, about 58s.
+- broad recentered optimizer: 1.1156, zero overlaps, about 675s.
+- winning branch family: `anchor_stage1_spread`.
+- winning broad-run candidate:
+  `LEGALIZER_WIDE_MUT2_FOCUS_LOWER_SAFETY_GAP`.
+- local refinement hurt the selected candidate, so it is disabled by default.
+
+Simplified tuner check on 2026-05-20:
+
+- adaptive IBM01: 1.1125, zero overlaps, about 242s evaluator runtime.
+- fast IBM01: 1.1125, zero overlaps, about 96s evaluator runtime.
+- selected IBM01 candidate:
+  `LOW_GAP_WIDE_LEGALIZER_LEGALIZER_GAP_ZERO`.
+- adaptive IBM02 smoke test: 1.6366, zero overlaps, about 194s evaluator
+  runtime, selected `anchor_stage1` with a Stage-1 density-relaxed variant.
+- The IBM02 run also caught a legality-ordering bug: legal candidates now beat
+  illegal candidates before proxy cost is compared.
+
+---
+
 ## Summary Table
 
 | Model | Main Idea | Status | ibm01 | All IBM | Runtime Notes | Keep Going? |
@@ -321,6 +464,7 @@ implemented yet.
 | `core.py` | Minimal-displacement legalization baseline | Ready | Pending | Pending | Designed for debugging and extension | Yes |
 | `rl_local_policy.py` | Sequential RL-style local action policy over legal moves | Ready | Pending | Pending | Educational RL bridge before full training | Yes |
 | `initializer.py` | Registry-backed initializer suite plus Stage-1 physical transforms | Ready | 1.1355 via final chain | 1.4938 via final tournament | Manual chains and readiness metrics available through `scripts/test_initializers.py` | Yes |
+| `ml_param_tournament.py` | Adaptive branch-family tuner over proven initializer chains | Experimental | 1.1125 | Pending | Fast mode reaches same IBM01 result in about 96s; logs to `runs/ml_param_tournament/` | Yes |
 | `submissions/final/placer.py` | Deterministic proxy-scored tournament with anchor Stage-1 candidates | Final candidate | 1.1355 | 1.4938 | Zero overlaps; 796.85s total IBM runtime; worst case 134.00s on ibm18 | Tune runtime/quality tradeoffs |
 
 ---

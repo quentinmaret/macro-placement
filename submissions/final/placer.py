@@ -360,20 +360,28 @@ class FinalMacroPlacer:
 
     def _chain_config(self, benchmark: Benchmark) -> Dict[str, Any]:
         n = benchmark.num_hard_macros
+
+        periphery_strength = 0.10
+        periphery_fraction = 0.08
+
         if n <= 220:
             macro_spread_iterations = 18
             force_smooth_iterations = 18
+            analytical_iterations = 16
             local_swap_iterations = 80
             search_radii = 150
             chain_budget_sec = 20.0
             stage_budget_sec = 8.0
+
         elif n <= 280:
             macro_spread_iterations = 12
             force_smooth_iterations = 8
+            analytical_iterations = 16
             local_swap_iterations = 30
             search_radii = 100
             chain_budget_sec = 20.0
             stage_budget_sec = 8.0
+
         else:
             macro_spread_iterations = 4
             force_smooth_iterations = 4
@@ -382,18 +390,9 @@ class FinalMacroPlacer:
             search_radii = 60
             chain_budget_sec = 14.0
             stage_budget_sec = 6.0
-            periphery_strength = 0.10
-            periphery_fraction = 0.08
-        if n <= 220:
-            analytical_iterations = 16
-            periphery_strength = 0.10
-            periphery_fraction = 0.08
-        elif n <= 280:
-            analytical_iterations = 16
-            periphery_strength = 0.10
-            periphery_fraction = 0.08
 
         canvas_scale = max(float(benchmark.canvas_width), float(benchmark.canvas_height), 1.0)
+
         return {
             "chain_budget_sec": chain_budget_sec,
             "stage_budget_sec": stage_budget_sec,
@@ -430,6 +429,7 @@ class FinalMacroPlacer:
             "spectral_order": {"max_macros": 320},
             "placer": {"search_radii": search_radii, "step_scale": 0.25, "safety_gap": 0.03},
         }
+
 
     def _run_chain_candidate(self, benchmark: Benchmark, chain: str) -> torch.Tensor:
         placement, metadata = run_initializer_chain(

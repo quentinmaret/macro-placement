@@ -129,6 +129,65 @@ def overlap_penalty(
     return area.sum() / 2.0
 
 
+def density_penalty(
+    positions: torch.Tensor,
+    sizes: torch.Tensor,
+    num_hard: int,
+    canvas_width: float,
+    canvas_height: float,
+    n_bins: int = 8,
+) -> torch.Tensor:
+    """
+    Differentiable density spreading penalty.
+
+    Divides the canvas into n_bins × n_bins grid. Each macro's area is
+    soft-assigned to its 4 nearest bins via bilinear interpolation. Bins
+    with more area than the canvas-wide uniform average are penalized.
+
+    This is THE missing ingredient in basic analytical placement: without
+    it, the wirelength gradient collapses all macros into a single cluster.
+    With it, the optimizer trades off local connectivity (wirelength wants
+    macros close) against global spreading (density wants them apart).
+
+    Returns a unit-less ratio (sum of overflow / target per bin) so a
+    weight in the range 100–2000 is meaningful relative to other terms.
+    """
+    pos = positions[:num_hard]
+    sz = sizes[:num_hard]
+    macro_areas = sz[:, 0] * sz[:, 1]                                # [H]
+
+    # Map positions to continuous bin coordinates in [0, n_bins).
+    bin_x = (pos[:, 0] / canvas_width)  * n_bins
+    bin_y = (pos[:, 1] / canvas_height) * n_bins
+
+    # Integer corners + fractional offsets for bilinear weights.
+    bx0 = bin_x.floor().long().clamp(0, n_bins - 1)
+    by0 = bin_y.floor().long().clamp(0, n_bins - 1)
+    bx1 = (bx0 + 1).clamp(max=n_bins - 1)
+    by1 = (by0 + 1).clamp(max=n_bins - 1)
+    fx = (bin_x - bx0.float()).clamp(0.0, 1.0)
+    fy = (bin_y - by0.float()).clamp(0.0, 1.0)
+
+    # Each macro's area splits across its 4 surrounding bins.
+    c00 = (1 - fx) * (1 - fy) * macro_areas
+    c10 = fx       * (1 - fy) * macro_areas
+    c01 = (1 - fx) * fy       * macro_areas
+    c11 = fx       * fy       * macro_areas
+
+    # Scatter into a flat bin tensor. scatter_add is differentiable through
+    # values (the contributions), which is what we need.
+    flat = torch.zeros(n_bins * n_bins, device=pos.device, dtype=pos.dtype)
+    flat = flat.scatter_add(0, by0 * n_bins + bx0, c00)
+    flat = flat.scatter_add(0, by0 * n_bins + bx1, c10)
+    flat = flat.scatter_add(0, by1 * n_bins + bx0, c01)
+    flat = flat.scatter_add(0, by1 * n_bins + bx1, c11)
+
+    # Uniform target = total macro area / bin count.
+    target = macro_areas.sum() / (n_bins * n_bins)
+    overflow = F.relu(flat - target)
+    return overflow.sum() / target.clamp(min=1e-9)
+
+
 def canvas_penalty(
     positions: torch.Tensor,
     sizes: torch.Tensor,

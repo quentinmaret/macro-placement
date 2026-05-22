@@ -15,12 +15,18 @@ import json
 import os
 import random
 import time
+import tempfile
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+import tempfile
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
-os.environ.setdefault("MPLCONFIGDIR", "/private/tmp/macro-placement-matplotlib")
-os.environ.setdefault("XDG_CACHE_HOME", "/private/tmp/macro-placement-cache")
+os.environ.setdefault(
+    "MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "macro-placement-matplotlib")
+)
+os.environ.setdefault(
+    "XDG_CACHE_HOME", os.path.join(tempfile.gettempdir(), "macro-placement-cache")
+)
 
 import numpy as np
 import torch
